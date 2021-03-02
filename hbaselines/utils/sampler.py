@@ -153,13 +153,13 @@ class Sampler(object):
             reset_all_obs = None
 
         return {
-            "obs": obs if not done else (obs, reset_obs),
+            "obs": obs if not reset else (obs, reset_obs),
             "context": context,
             "action": action,
             "reward": reward,
             "done": done,
             "env_num": self._env_num,
-            "all_obs": all_obs if not done else (all_obs, reset_all_obs),
+            "all_obs": all_obs if not reset else (all_obs, reset_all_obs),
             "info": info,
         }
 

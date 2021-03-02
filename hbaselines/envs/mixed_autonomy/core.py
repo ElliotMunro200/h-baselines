@@ -96,10 +96,9 @@ class FlowEnv(gym.Env):
         # Check if the time horizon has been met.
         self.step_number += 1
         if isinstance(done, dict):
-            all_done = done or self.step_number == self.horizon
             done = {key: done[key] or self.step_number == self.horizon
                     for key in obs.keys()}
-            done["__all__"] = all_done
+            done["__all__"] = self.step_number == self.horizon
         else:
             done = done or self.step_number == self.horizon
 

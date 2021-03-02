@@ -538,19 +538,14 @@ class FeedForwardPolicy(Policy):
         # Add the contextual observation, if applicable.
         obs = self._get_obs(obs, context, axis=1)
 
-        action, values, neglogpacs = self.sess.run(
-            [self.action if apply_noise else self.pi_mean,
-             self.value_flat, self.neglogp],
+        action = self.sess.run(
+            self.action if apply_noise else self.pi_mean,
             feed_dict={
                 self.obs_ph: obs,
                 self.phase_ph: 0,
                 self.rate_ph: 0.0,
             }
         )
-
-        # Store information on the values and negative-log likelihood.
-        self.mb_values[env_num].append(values)
-        self.mb_neglogpacs[env_num].append(neglogpacs)
 
         return action
 
@@ -594,12 +589,40 @@ class FeedForwardPolicy(Policy):
         self.mb_actions[env_num].append(action.reshape(1, -1))
         self.mb_dones[env_num].append(done)
 
+        # Store information on the values and negative-log likelihood.
+        values, neglogpacs = self.sess.run(
+            [self.value_flat, self.neglogp],
+            feed_dict={
+                self.obs_ph: obs0,
+                self.phase_ph: 0,
+                self.rate_ph: 0.0,
+            }
+        )
+        self.mb_values[env_num].append(values)
+        self.mb_neglogpacs[env_num].append(neglogpacs)
+
         # Update the last observation (to compute the last value for the GAE
         # expected returns).
         self.last_obs[env_num] = self._get_obs([obs1], context1)
 
     def update(self, **kwargs):
         """See parent class."""
+        # In case not all environment numbers were used, reduce the shape of
+        # the datasets.
+        num_envs = sum([
+            int(self.last_obs[i] is not None) for i in range(self.num_envs)])
+
+        self.mb_rewards = self.mb_rewards[:num_envs]
+        self.mb_obs = self.mb_obs[:num_envs]
+        self.mb_contexts = self.mb_contexts[:num_envs]
+        self.mb_actions = self.mb_actions[:num_envs]
+        self.mb_values = self.mb_values[:num_envs]
+        self.mb_neglogpacs = self.mb_neglogpacs[:num_envs]
+        self.mb_dones = self.mb_dones[:num_envs]
+        self.mb_all_obs = self.mb_all_obs[:num_envs]
+        self.mb_returns = self.mb_returns[:num_envs]
+        self.last_obs = self.last_obs[:num_envs]
+
         # Compute the last estimated value.
         last_values = [
             self.sess.run(
@@ -609,7 +632,7 @@ class FeedForwardPolicy(Policy):
                     self.phase_ph: 0,
                     self.rate_ph: 0.0,
                 })
-            for env_num in range(self.num_envs)
+            for env_num in range(num_envs)
         ]
 
         (self.mb_obs,
@@ -634,7 +657,7 @@ class FeedForwardPolicy(Policy):
             last_values=last_values,
             gamma=self.gamma,
             lam=self.lam,
-            num_envs=self.num_envs,
+            num_envs=num_envs,
         )
 
         # Run the optimization procedure.

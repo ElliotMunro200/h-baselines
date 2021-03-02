@@ -162,7 +162,8 @@ class AVOpenMultiAgentEnv(AVMultiAgentEnv):
 
     def step(self, rl_actions):
         """See parent class."""
-        obs, reward, done, info = super(AVMultiAgentEnv, self).step(rl_actions)
+        obs, reward, done, info = super(AVOpenMultiAgentEnv, self).step(
+            rl_actions)
 
         # Set the done mask for cars the exited the control range to True.
         for key in obs.keys():
