@@ -95,7 +95,13 @@ class FlowEnv(gym.Env):
 
         # Check if the time horizon has been met.
         self.step_number += 1
-        done = done or self.step_number == self.horizon
+        if isinstance(done, dict):
+            all_done = done or self.step_number == self.horizon
+            done = {key: done[key] or self.step_number == self.horizon
+                    for key in obs.keys()}
+            done["__all__"] = all_done
+        else:
+            done = done or self.step_number == self.horizon
 
         # Add the full-state observation, if needed.
         if self.maddpg:

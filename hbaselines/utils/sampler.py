@@ -142,10 +142,9 @@ class Sampler(object):
         context = getattr(self.env, "current_context", None)
 
         # Done mask for multi-agent policies is slightly different.
-        if isinstance(done, dict):
-            done = done["__all__"]
+        reset = done["__all__"] if isinstance(done, dict) else done
 
-        if done:
+        if reset:
             # Reset the environment.
             reset_obs = self.env.reset()
             reset_obs, reset_all_obs = get_obs(reset_obs)
