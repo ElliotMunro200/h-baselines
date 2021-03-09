@@ -526,9 +526,9 @@ class MultiAgentPolicy(Policy):
                 del self._agent_index[env_num][key]
 
         # Collect the indices that are still available.
-        free_indices = list(
+        free_indices = sorted(list(
             set(range(self.n_agents)) -
-            set(self._agent_index[env_num].items()))
+            set(self._agent_index[env_num].values())))
 
         # Check if new agents are available.
         for key in obs.keys():

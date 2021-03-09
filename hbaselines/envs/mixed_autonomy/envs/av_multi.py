@@ -97,7 +97,7 @@ class AVMultiAgentEnv(AVEnv):
 
             reward = {
                 key: (- c1 * (self.k.vehicle.get_speed(key) - self._v_eq) ** 2
-                      - c2 * self.k.vehicle.get_accel(key) ** 2)
+                      - c2 * rl_actions[key][0] ** 2)
                 for key in rl_ids
             }
 

@@ -471,8 +471,6 @@ def create_fcnet(obs,
             policy_mean = layer(
                 pi_h, num_output, 'mean',
                 act_fun=None,
-                kernel_initializer=tf.random_uniform_initializer(
-                    minval=-3e-3, maxval=3e-3)
             )
 
             # Create the output log_std.
@@ -635,26 +633,35 @@ def gae_returns(mb_rewards, mb_values, mb_dones, last_values, gamma, lam):
         GAE-style expected discounted returns.
     """
     n_steps = mb_rewards.shape[0]
+    # print(mb_rewards)
+    print(mb_dones)
 
     # Discount/bootstrap off value fn.
     mb_advs = np.zeros_like(mb_rewards)
     mb_vactual = np.zeros_like(mb_rewards)
     lastgaelam = 0
+    traj_length = []
     for t in reversed(range(n_steps)):
         if t == n_steps - 1:
+            if mb_dones[-1]:
+                traj_length.append(0)
             nextnonterminal = 1.0 - mb_dones[-1]
             nextvalues = last_values
             mb_vactual[t] = mb_rewards[t]
         else:
+            if mb_dones[t + 1]:
+                traj_length.append(0)
             nextnonterminal = 1.0 - mb_dones[t+1]
             nextvalues = mb_values[t+1]
             mb_vactual[t] = mb_rewards[t] \
                 + gamma * nextnonterminal * nextvalues
+        traj_length[-1] += 1
         delta = mb_rewards[t] \
             + gamma * nextvalues * nextnonterminal - mb_values[t]
         mb_advs[t] = lastgaelam = delta \
             + gamma * lam * nextnonterminal * lastgaelam
     mb_returns = mb_advs + mb_values
+    print(traj_length)
 
     return mb_returns
 
@@ -671,7 +678,8 @@ def process_minibatch(mb_obs,
                       last_values,
                       gamma,
                       lam,
-                      num_envs):
+                      num_envs,
+                      max_traj_length):
     """Process a minibatch of samples.
 
     This method re-formats the data to numpy arrays that can be passed to
@@ -735,8 +743,6 @@ def process_minibatch(mb_obs,
     int
         the number of sampled steps in the minibatch
     """
-    n_steps = 0
-
     for env_num in range(num_envs):
         # Convert the data to numpy arrays.
         mb_obs[env_num] = np.concatenate(mb_obs[env_num], axis=0)
@@ -746,7 +752,23 @@ def process_minibatch(mb_obs,
         mb_neglogpacs[env_num] = np.concatenate(
             mb_neglogpacs[env_num], axis=0)
         mb_dones[env_num] = np.asarray(mb_dones[env_num])
-        n_steps += mb_obs[env_num].shape[0]
+
+        # TODO
+        if max_traj_length is not None:
+            (mb_obs[env_num],
+             mb_rewards[env_num],
+             mb_actions[env_num],
+             mb_values[env_num],
+             mb_neglogpacs[env_num],
+             mb_dones[env_num]) = segment_trajectory(
+                mb_obs=mb_obs[env_num].copy(),
+                mb_rewards=mb_rewards[env_num],
+                mb_actions=mb_actions[env_num],
+                mb_values=mb_values[env_num],
+                mb_neglogpacs=mb_neglogpacs[env_num],
+                mb_dones=mb_dones[env_num],
+                max_traj_length=max_traj_length,
+            )
 
         # Compute the bootstrapped/discounted returns.
         mb_returns[env_num] = gae_returns(
@@ -758,9 +780,17 @@ def process_minibatch(mb_obs,
             lam=lam,
         )
 
+    # TODO.
+    mb_obs = [x for x in mb_obs if len(x) > 0]
+    mb_rewards = [x for x in mb_rewards if len(x) > 0]
+    mb_actions = [x for x in mb_actions if len(x) > 0]
+    mb_values = [x for x in mb_values if len(x) > 0]
+    mb_neglogpacs = [x for x in mb_neglogpacs if len(x) > 0]
+    mb_dones = [x for x in mb_dones if len(x) > 0]
+
     # Concatenate the stored data.
-    if num_envs > 1:
-        mb_obs = np.concatenate(mb_obs, axis=0)
+    if len(mb_obs) > 1:
+        mb_obs = np.concatenate(mb_obs)
         mb_contexts = np.concatenate(mb_contexts, axis=0)
         mb_actions = np.concatenate(mb_actions, axis=0)
         mb_values = np.concatenate(mb_values, axis=0)
@@ -780,8 +810,134 @@ def process_minibatch(mb_obs,
     advs = mb_returns - mb_values
     mb_advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
+    n_steps = mb_obs.shape[0]
+
     return mb_obs, mb_contexts, mb_actions, mb_values, mb_neglogpacs, \
         mb_all_obs, mb_rewards, mb_returns, mb_dones, mb_advs, n_steps
+
+
+def segment_trajectory(mb_obs,
+                       mb_rewards,
+                       mb_actions,
+                       mb_values,
+                       mb_neglogpacs,
+                       mb_dones,
+                       max_traj_length):
+    """TODO.
+
+    This method performs the following operations:
+
+    1. TODO
+    2. TODO
+    3. TODO
+
+    Parameters
+    ----------
+    mb_obs : TODO
+        TODO
+    mb_rewards : TODO
+        TODO
+    mb_actions : TODO
+        TODO
+    mb_values : TODO
+        TODO
+    mb_neglogpacs : TODO
+        TODO
+    mb_dones : TODO
+        TODO
+    max_traj_length : int
+        TODO
+
+    Returns
+    -------
+    TODO
+        TODO
+    TODO
+        TODO
+    TODO
+        TODO
+    TODO
+        TODO
+    TODO
+        TODO
+    TODO
+        TODO
+    """
+    # Compute the length of each trajectory. The length of the trajectories are
+    # defined as the number of time steps before a done mask is set to True.
+    n_steps = mb_rewards.shape[0]
+    traj_length = [0]
+    t_start = [0]
+    for t in range(n_steps - 1):
+        traj_length[-1] += 1
+        if mb_dones[t]:
+            traj_length.append(0)
+            t_start.append(t+1)
+    t_start.append(n_steps)
+
+    # Remove the trajectories whose length is length than the desired max
+    # trajectory length.
+    valid_trajectories = []
+    for i in range(len(traj_length)):
+        if traj_length[i] >= max_traj_length:
+            valid_trajectories.extend(list(range(t_start[i], t_start[i+1])))
+
+    mb_obs = mb_obs[valid_trajectories]
+    mb_rewards = mb_rewards[valid_trajectories]
+    mb_actions = mb_actions[valid_trajectories]
+    mb_values = mb_values[valid_trajectories]
+    mb_neglogpacs = mb_neglogpacs[valid_trajectories]
+    mb_dones = mb_dones[valid_trajectories]
+
+    # ======================================================================= #
+    # Segment the remaining trajectories to set of subset trajectories that   #
+    # are the desired length.                                                 #
+    # ======================================================================= #
+
+    # Recompute the trajectory start locations.
+    n_steps = len(mb_dones)
+    t_start = [0]
+    for t in range(n_steps - 1):
+        if mb_dones[t]:
+            t_start.append(t + 1)
+    t_start.append(n_steps)
+
+    # Get the indices for sub-trajectories.
+    indices = []
+    for i in range(len(t_start) - 1):
+        indx = t_start[i]
+        while t_start[i + 1] - indx > max_traj_length:
+            indices.append(list(range(indx, indx + max_traj_length)))
+            indx += max_traj_length
+        if indx > 0:
+            indices.append(list(
+                range(t_start[i + 1] - max_traj_length, t_start[i + 1])))
+
+    # Get sub-trajectories.
+    if len(indices) > 0:
+        new_mb_obs = []
+        new_mb_rewards = []
+        new_mb_actions = []
+        new_mb_values = []
+        new_mb_neglogpacs = []
+        new_mb_dones = []
+        for indx in indices:
+            new_mb_obs.extend(list(mb_obs[indx]))
+            new_mb_rewards.extend(list(mb_rewards[indx]))
+            new_mb_actions.extend(list(mb_actions[indx]))
+            new_mb_values.extend(list(mb_values[indx]))
+            new_mb_neglogpacs.extend(list(mb_neglogpacs[indx]))
+            new_mb_dones.extend([0] * (max_traj_length - 1) + [1])
+
+        # Convert to array
+        mb_obs = np.array(new_mb_obs)
+        mb_rewards = np.array(new_mb_rewards)
+        mb_actions = np.array(new_mb_actions)
+        mb_values = np.array(new_mb_values)
+        mb_neglogpacs = np.array(new_mb_neglogpacs)
+        mb_dones = np.array(new_mb_dones)
+
+    return mb_obs, mb_rewards, mb_actions, mb_values,  mb_neglogpacs, mb_dones
 
 
 def setup_target_updates(model_scope, target_scope, scope, tau, verbose):
