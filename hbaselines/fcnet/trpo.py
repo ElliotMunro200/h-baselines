@@ -411,102 +411,14 @@ class TRPO(ActorCriticRLModel):
             len_buffer = deque(maxlen=40)
             reward_buffer = deque(maxlen=40)
 
-            while True:
-                if timesteps_so_far >= total_timesteps:
-                    break
+            while timesteps_so_far < total_timesteps:
 
                 print("********* Iteration %i ***********" % iters_so_far)
 
-                def fisher_vector_product(vec):
-                    return self.compute_fvp(
-                        vec, *fvpargs, sess=self.sess) + self.cg_damping * vec
-
-                # ------------------ Update G ------------------
                 print("Optimizing Policy...")
 
-                mean_losses = None
                 seg = seg_gen.__next__()
-
-                add_vtarg_and_adv(seg, self.gamma, self.lam)
-                atarg, tdlamret = seg["adv"], seg["tdlamret"]
-
-                # predicted value function before update
-                vpredbefore = seg["vpred"]
-                # standardized advantage function estimate
-                atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
-
-                args = seg["observations"], seg["observations"], \
-                    seg["actions"], atarg
-                # Subsampling: see p40-42 of John Schulman thesis
-                # http://joschu.net/docs/thesis.pdf
-                fvpargs = [arr[::5] for arr in args]
-
-                self.assign_old_eq_new(sess=self.sess)
-
-                run_options = tf.RunOptions(
-                    trace_level=tf.RunOptions.FULL_TRACE)
-                run_metadata = None
-                # run loss backprop with summary, and save the metadata
-                # (memory, compute time, ...)
-                _, grad, *lossbefore = self.compute_lossandgrad(
-                    *args,
-                    tdlamret,
-                    sess=self.sess,
-                    options=run_options,
-                    run_metadata=run_metadata,
-                )
-
-                lossbefore = np.array(lossbefore)
-                if np.allclose(grad, 0):
-                    print("Got zero gradient. not updating")
-                else:
-                    stepdir = conjugate_gradient(
-                        fisher_vector_product,
-                        grad,
-                        cg_iters=self.cg_iters,
-                        verbose=self.verbose >= 1,
-                    )
-                    assert np.isfinite(stepdir).all()
-                    shs = .5 * stepdir.dot(fisher_vector_product(stepdir))
-                    # abs(shs) to avoid taking square root of negative values
-                    lagrange_multiplier = np.sqrt(abs(shs) / self.max_kl)
-                    fullstep = stepdir / lagrange_multiplier
-                    expectedimprove = grad.dot(fullstep)
-                    surrbefore = lossbefore[0]
-                    stepsize = 1.0
-                    thbefore = self.get_flat()
-                    for _ in range(10):
-                        thnew = thbefore + fullstep * stepsize
-                        self.set_from_flat(thnew)
-                        mean_losses = surr, kl_loss, *_ = np.array(
-                            self.compute_losses(*args, sess=self.sess))
-                        improve = surr - surrbefore
-                        print("Expected: %.3f Actual: %.3f" % (
-                            expectedimprove, improve))
-                        if not np.isfinite(mean_losses).all():
-                            print("Got non-finite value of losses -- bad!")
-                        elif kl_loss > self.max_kl * 1.5:
-                            print("violated KL constraint. shrinking step.")
-                        elif improve < 0:
-                            print("surrogate didn't improve. shrinking step.")
-                        else:
-                            print("Stepsize OK!")
-                            break
-                        stepsize *= .5
-                    else:
-                        print("couldn't compute a good step")
-                        self.set_from_flat(thbefore)
-
-                for _ in range(self.vf_iters):
-                    # NOTE: for recurrent policies, use shuffle=False?
-                    for (mbob, mbret) in dataset.iterbatches(
-                            (seg["observations"], seg["tdlamret"]),
-                            include_final_partial_batch=False,
-                            batch_size=128,
-                            shuffle=True):
-                        grad = self.compute_vflossandgrad(
-                            mbob, mbob, mbret, sess=self.sess)
-                        self.vfadam.update(grad, self.vf_stepsize)
+                mean_losses, vpredbefore, tdlamret = self._train(seg)
 
                 # lr: lengths and rewards
                 lens, rews = (seg["ep_lens"], seg["ep_rets"])
@@ -528,6 +440,96 @@ class TRPO(ActorCriticRLModel):
                     episodes_so_far,
                     t_start,
                 )
+
+    def _train(self, seg):
+
+        def fisher_vector_product(vec):
+            return self.compute_fvp(
+                vec, *fvpargs, sess=self.sess) + self.cg_damping * vec
+
+        mean_losses = None
+
+        add_vtarg_and_adv(seg, self.gamma, self.lam)
+        atarg, tdlamret = seg["adv"], seg["tdlamret"]
+
+        # predicted value function before update
+        vpredbefore = seg["vpred"]
+        # standardized advantage function estimate
+        atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
+
+        args = seg["observations"], seg["observations"], seg["actions"], atarg
+        # Subsampling: see p40-42 of John Schulman thesis
+        # http://joschu.net/docs/thesis.pdf
+        fvpargs = [arr[::5] for arr in args]
+
+        self.assign_old_eq_new(sess=self.sess)
+
+        run_options = tf.RunOptions(
+            trace_level=tf.RunOptions.FULL_TRACE)
+        run_metadata = None
+        # run loss backprop with summary, and save the metadata
+        # (memory, compute time, ...)
+        _, grad, *lossbefore = self.compute_lossandgrad(
+            *args,
+            tdlamret,
+            sess=self.sess,
+            options=run_options,
+            run_metadata=run_metadata,
+        )
+
+        lossbefore = np.array(lossbefore)
+        if np.allclose(grad, 0):
+            print("Got zero gradient. not updating")
+        else:
+            stepdir = conjugate_gradient(
+                fisher_vector_product,
+                grad,
+                cg_iters=self.cg_iters,
+                verbose=self.verbose >= 1,
+            )
+            assert np.isfinite(stepdir).all()
+            shs = .5 * stepdir.dot(fisher_vector_product(stepdir))
+            # abs(shs) to avoid taking square root of negative values
+            lagrange_multiplier = np.sqrt(abs(shs) / self.max_kl)
+            fullstep = stepdir / lagrange_multiplier
+            expectedimprove = grad.dot(fullstep)
+            surrbefore = lossbefore[0]
+            stepsize = 1.0
+            thbefore = self.get_flat()
+            for _ in range(10):
+                thnew = thbefore + fullstep * stepsize
+                self.set_from_flat(thnew)
+                mean_losses = surr, kl_loss, *_ = np.array(
+                    self.compute_losses(*args, sess=self.sess))
+                improve = surr - surrbefore
+                print("Expected: %.3f Actual: %.3f" % (
+                    expectedimprove, improve))
+                if not np.isfinite(mean_losses).all():
+                    print("Got non-finite value of losses -- bad!")
+                elif kl_loss > self.max_kl * 1.5:
+                    print("violated KL constraint. shrinking step.")
+                elif improve < 0:
+                    print("surrogate didn't improve. shrinking step.")
+                else:
+                    print("Stepsize OK!")
+                    break
+                stepsize *= .5
+            else:
+                print("couldn't compute a good step")
+                self.set_from_flat(thbefore)
+
+        for _ in range(self.vf_iters):
+            # NOTE: for recurrent policies, use shuffle=False?
+            for (mbob, mbret) in dataset.iterbatches(
+                    (seg["observations"], seg["tdlamret"]),
+                    include_final_partial_batch=False,
+                    batch_size=128,
+                    shuffle=True):
+                grad = self.compute_vflossandgrad(
+                    mbob, mbob, mbret, sess=self.sess)
+                self.vfadam.update(grad, self.vf_stepsize)
+
+        return mean_losses, vpredbefore, tdlamret
 
     def _log_training(self,
                       mean_losses,
