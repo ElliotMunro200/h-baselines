@@ -4,6 +4,10 @@ import numpy as np
 from collections import deque
 from mpi4py import MPI
 
+from hbaselines.utils.tf_util import make_session
+from hbaselines.utils.tf_util import get_globals_vars
+from hbaselines.utils.tf_util import get_trainable_vars
+
 import stable_baselines.common.tf_util as tf_util
 from stable_baselines.common import dataset
 from stable_baselines.common import ActorCriticRLModel
@@ -55,7 +59,7 @@ def add_vtarg_and_adv(seg, gamma, lam):
 
 def zipsame(*seqs):
     """
-    Performes a zip function, but asserts that all zipped elements are of the same size
+    Performs a zip function, but asserts that all zipped elements are of the same size
 
     :param seqs: a list of arrays that are zipped together
     :return: the zipped arguments
@@ -63,16 +67,6 @@ def zipsame(*seqs):
     length = len(seqs[0])
     assert all(len(seq) == length for seq in seqs[1:])
     return zip(*seqs)
-
-
-def flatten_lists(listoflists):
-    """
-    Flatten a python list of list
-
-    :param listoflists: (list(list))
-    :return: (list)
-    """
-    return [el for list_ in listoflists for el in list_]
 
 
 def conjugate_gradient(f_ax,
@@ -222,7 +216,6 @@ class TRPO(ActorCriticRLModel):
         self.get_flat = None
         self.set_from_flat = None
         self.timed = None
-        self.allmean = None
         self.reward_giver = None
         self.step = None
         self.proba_step = None
@@ -239,7 +232,7 @@ class TRPO(ActorCriticRLModel):
         self.graph = tf.Graph()
         with self.graph.as_default():
             self.set_random_seed(self.seed)
-            self.sess = tf_util.make_session(
+            self.sess = make_session(
                 num_cpu=self.n_cpu_tf_sess, graph=self.graph)
 
             # Construct network for new policy
@@ -294,17 +287,10 @@ class TRPO(ActorCriticRLModel):
 
                 optimgain = surrgain + entbonus
                 losses = [optimgain, meankl, entbonus, surrgain, meanent]
-                self.loss_names = [
-                    "optimgain",
-                    "meankl",
-                    "entloss",
-                    "surrgain",
-                    "entropy",
-                ]
+                self.loss_names = ["optimgain", "meankl", "entloss",
+                                   "surrgain", "entropy"]
 
-                dist = meankl
-
-                all_var_list = tf_util.get_trainable_vars("model")
+                all_var_list = get_trainable_vars("model")
                 var_list = [
                     v for v in all_var_list
                     if "/vf" not in v.name and "/q/" not in v.name]
@@ -316,7 +302,7 @@ class TRPO(ActorCriticRLModel):
                 self.set_from_flat = tf_util.SetFromFlat(
                     var_list, sess=self.sess)
 
-                klgrads = tf.gradients(dist, var_list)
+                klgrads = tf.gradients(meankl, var_list)
                 flat_tangent = tf.placeholder(
                     dtype=tf.float32,
                     shape=[None],
@@ -347,8 +333,8 @@ class TRPO(ActorCriticRLModel):
                     [],
                     [],
                     updates=[tf.assign(oldv, newv) for (oldv, newv) in
-                             zipsame(tf_util.get_globals_vars("oldpi"),
-                                     tf_util.get_globals_vars("model"))],
+                             zipsame(get_globals_vars("oldpi"),
+                                     get_globals_vars("model"))],
                 )
                 self.compute_losses = tf_util.function(
                     [observation, old_policy.obs_ph, action, atarg],
@@ -360,12 +346,6 @@ class TRPO(ActorCriticRLModel):
                     [observation, old_policy.obs_ph, ret],
                     tf_util.flatgrad(vferr, vf_var_list),
                 )
-
-                def allmean(arr):
-                    assert isinstance(arr, np.ndarray)
-                    out = np.empty_like(arr)
-                    MPI.COMM_WORLD.Allreduce(arr, out, op=MPI.SUM)
-                    return out
 
                 tf_util.initialize(sess=self.sess)
 
@@ -387,14 +367,12 @@ class TRPO(ActorCriticRLModel):
                 tf.summary.scalar(
                     'kl_clip_range', tf.reduce_mean(self.max_kl))
 
-            self.allmean = allmean
-
             self.step = self.policy_pi.step
             self.proba_step = self.policy_pi.proba_step
             self.initial_state = self.policy_pi.initial_state
 
-            self.params = tf_util.get_trainable_vars("model") + \
-                tf_util.get_trainable_vars("oldpi")
+            self.params = get_trainable_vars("model") + \
+                get_trainable_vars("oldpi")
 
             self.summary = tf.summary.merge_all()
 
@@ -440,9 +418,8 @@ class TRPO(ActorCriticRLModel):
                 print("********* Iteration %i ***********" % iters_so_far)
 
                 def fisher_vector_product(vec):
-                    return self.allmean(
-                        self.compute_fvp(vec, *fvpargs, sess=self.sess)
-                    ) + self.cg_damping * vec
+                    return self.compute_fvp(
+                        vec, *fvpargs, sess=self.sess) + self.cg_damping * vec
 
                 # ------------------ Update G ------------------
                 print("Optimizing Policy...")
@@ -479,8 +456,7 @@ class TRPO(ActorCriticRLModel):
                     run_metadata=run_metadata,
                 )
 
-                lossbefore = self.allmean(np.array(lossbefore))
-                grad = self.allmean(grad)
+                lossbefore = np.array(lossbefore)
                 if np.allclose(grad, 0):
                     print("Got zero gradient. not updating")
                 else:
@@ -502,9 +478,8 @@ class TRPO(ActorCriticRLModel):
                     for _ in range(10):
                         thnew = thbefore + fullstep * stepsize
                         self.set_from_flat(thnew)
-                        mean_losses = surr, kl_loss, *_ = self.allmean(
-                            np.array(self.compute_losses(
-                                *args, sess=self.sess)))
+                        mean_losses = surr, kl_loss, *_ = np.array(
+                            self.compute_losses(*args, sess=self.sess))
                         improve = surr - surrbefore
                         print("Expected: %.3f Actual: %.3f" % (
                             expectedimprove, improve))
@@ -522,10 +497,6 @@ class TRPO(ActorCriticRLModel):
                         print("couldn't compute a good step")
                         self.set_from_flat(thbefore)
 
-                    for (loss_name, loss_val) in zip(
-                            self.loss_names, mean_losses):
-                        logger.record_tabular(loss_name, loss_val)
-
                 for _ in range(self.vf_iters):
                     # NOTE: for recurrent policies, use shuffle=False?
                     for (mbob, mbret) in dataset.iterbatches(
@@ -533,44 +504,62 @@ class TRPO(ActorCriticRLModel):
                             include_final_partial_batch=False,
                             batch_size=128,
                             shuffle=True):
-                        grad = self.allmean(self.compute_vflossandgrad(
-                            mbob, mbob, mbret, sess=self.sess))
+                        grad = self.compute_vflossandgrad(
+                            mbob, mbob, mbret, sess=self.sess)
                         self.vfadam.update(grad, self.vf_stepsize)
 
-                logger.record_tabular(
-                    "explained_variance_tdlam_before",
-                    explained_variance(vpredbefore, tdlamret))
-
                 # lr: lengths and rewards
-                lr_local = (seg["ep_lens"], seg["ep_rets"])
-                list_lr_pairs = MPI.COMM_WORLD.allgather(lr_local)
-                lens, rews = map(flatten_lists, zip(*list_lr_pairs))
-
+                lens, rews = (seg["ep_lens"], seg["ep_rets"])
                 len_buffer.extend(lens)
                 reward_buffer.extend(rews)
-
-                if len(len_buffer) > 0:
-                    logger.record_tabular(
-                        "EpLenMean", np.mean(len_buffer))
-                    logger.record_tabular(
-                        "EpRewMean", np.mean(reward_buffer))
-                logger.record_tabular("EpThisIter", len(lens))
                 episodes_so_far += len(lens)
-                current_it_timesteps = MPI.COMM_WORLD.allreduce(
-                    seg["total_timestep"])
+                current_it_timesteps = seg["total_timestep"]
                 timesteps_so_far += current_it_timesteps
-                self.num_timesteps += current_it_timesteps
                 iters_so_far += 1
+                self.num_timesteps += current_it_timesteps
 
-                logger.record_tabular("EpisodesSoFar", episodes_so_far)
-                logger.record_tabular("TimestepsSoFar", self.num_timesteps)
-                logger.record_tabular("TimeElapsed", time.time() - t_start)
+                self._log_training(
+                    mean_losses,
+                    vpredbefore,
+                    tdlamret,
+                    len_buffer,
+                    reward_buffer,
+                    lens,
+                    episodes_so_far,
+                    t_start,
+                )
 
-                if self.verbose >= 1:
-                    logger.dump_tabular()
+    def _log_training(self,
+                      mean_losses,
+                      vpredbefore,
+                      tdlamret,
+                      len_buffer,
+                      reward_buffer,
+                      lens,
+                      episodes_so_far,
+                      t_start):
 
-    def _log_training(self):
-        pass
+        for (loss_name, loss_val) in zip(
+                self.loss_names, mean_losses):
+            logger.record_tabular(loss_name, loss_val)
+
+        logger.record_tabular(
+            "explained_variance_tdlam_before",
+            explained_variance(vpredbefore, tdlamret))
+
+        if len(len_buffer) > 0:
+            logger.record_tabular(
+                "EpLenMean", np.mean(len_buffer))
+            logger.record_tabular(
+                "EpRewMean", np.mean(reward_buffer))
+        logger.record_tabular("EpThisIter", len(lens))
+
+        logger.record_tabular("EpisodesSoFar", episodes_so_far)
+        logger.record_tabular("TimestepsSoFar", self.num_timesteps)
+        logger.record_tabular("TimeElapsed", time.time() - t_start)
+
+        if self.verbose >= 1:
+            logger.dump_tabular()
 
     def _get_pretrain_placeholders(self):
         pass
