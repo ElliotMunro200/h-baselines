@@ -1,7 +1,6 @@
 import time
 import tensorflow as tf
 import numpy as np
-from contextlib import contextmanager
 from collections import deque
 from mpi4py import MPI
 
@@ -15,40 +14,6 @@ from stable_baselines import logger
 from stable_baselines.common.mpi_adam import MpiAdam
 from stable_baselines.common.runners import traj_segment_generator
 from stable_baselines.trpo_mpi.utils import add_vtarg_and_adv
-
-
-COLOR_TO_NUM = dict(
-    gray=30,
-    red=31,
-    green=32,
-    yellow=33,
-    blue=34,
-    magenta=35,
-    cyan=36,
-    white=37,
-    crimson=38
-)
-
-
-def colorize(string, color, bold=False, highlight=False):
-    """
-    Colorize, bold and/or highlight a string for terminal print
-
-    :param string: (str) input string
-    :param color: (str) the color, the lookup table is the dict at
-        console_util.color2num
-    :param bold: (bool) if the string should be bold or not
-    :param highlight: (bool) if the string should be highlighted or not
-    :return: (str) the stylized output string
-    """
-    attr = []
-    num = COLOR_TO_NUM[color]
-    if highlight:
-        num += 10
-    attr.append(str(num))
-    if bold:
-        attr.append('1')
-    return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
 
 
 def flatten_lists(listoflists):
@@ -353,17 +318,6 @@ class TRPO(ActorCriticRLModel):
                     tf_util.flatgrad(vferr, vf_var_list),
                 )
 
-                @contextmanager
-                def timed(msg):
-                    if self.verbose >= 1:
-                        print(colorize(msg, color='magenta'))
-                        start_time = time.time()
-                        yield
-                        print(colorize("done in {:.3f} seconds".format(
-                            (time.time() - start_time)), color='magenta'))
-                    else:
-                        yield
-
                 def allmean(arr):
                     assert isinstance(arr, np.ndarray)
                     out = np.empty_like(arr)
@@ -390,7 +344,6 @@ class TRPO(ActorCriticRLModel):
                 tf.summary.scalar(
                     'kl_clip_range', tf.reduce_mean(self.max_kl))
 
-            self.timed = timed
             self.allmean = allmean
 
             self.step = self.policy_pi.step
@@ -456,16 +409,13 @@ class TRPO(ActorCriticRLModel):
 
                     # ------------------ Update G ------------------
                     print("Optimizing Policy...")
-                    # g_step = 1 when not using GAIL
+
                     mean_losses = None
                     vpredbefore = None
                     tdlamret = None
                     observation = None
                     action = None
-                    seg = None
-
-                    with self.timed("sampling"):
-                        seg = seg_gen.__next__()
+                    seg = seg_gen.__next__()
 
                     add_vtarg_and_adv(seg, self.gamma, self.lam)
                     observation, action = seg["observations"], seg["actions"]
@@ -484,44 +434,42 @@ class TRPO(ActorCriticRLModel):
 
                     self.assign_old_eq_new(sess=self.sess)
 
-                    with self.timed("computegrad"):
-                        steps = self.num_timesteps + seg["total_timestep"]
-                        run_options = tf.RunOptions(
-                            trace_level=tf.RunOptions.FULL_TRACE)
-                        run_metadata = None
-                        # run loss backprop with summary, and save the metadata
-                        # (memory, compute time, ...)
-                        if writer is not None:
-                            summary, grad, *lossbefore = \
-                                self.compute_lossandgrad(
-                                    *args,
-                                    tdlamret,
-                                    sess=self.sess,
-                                    options=run_options,
-                                    run_metadata=run_metadata,
-                                )
-                            writer.add_summary(summary, steps)
-                        else:
-                            _, grad, *lossbefore = self.compute_lossandgrad(
+                    steps = self.num_timesteps + seg["total_timestep"]
+                    run_options = tf.RunOptions(
+                        trace_level=tf.RunOptions.FULL_TRACE)
+                    run_metadata = None
+                    # run loss backprop with summary, and save the metadata
+                    # (memory, compute time, ...)
+                    if writer is not None:
+                        summary, grad, *lossbefore = \
+                            self.compute_lossandgrad(
                                 *args,
                                 tdlamret,
                                 sess=self.sess,
                                 options=run_options,
                                 run_metadata=run_metadata,
                             )
+                        writer.add_summary(summary, steps)
+                    else:
+                        _, grad, *lossbefore = self.compute_lossandgrad(
+                            *args,
+                            tdlamret,
+                            sess=self.sess,
+                            options=run_options,
+                            run_metadata=run_metadata,
+                        )
 
                     lossbefore = self.allmean(np.array(lossbefore))
                     grad = self.allmean(grad)
                     if np.allclose(grad, 0):
                         print("Got zero gradient. not updating")
                     else:
-                        with self.timed("conjugate_gradient"):
-                            stepdir = conjugate_gradient(
-                                fisher_vector_product,
-                                grad,
-                                cg_iters=self.cg_iters,
-                                verbose=self.verbose >= 1,
-                            )
+                        stepdir = conjugate_gradient(
+                            fisher_vector_product,
+                            grad,
+                            cg_iters=self.cg_iters,
+                            verbose=self.verbose >= 1,
+                        )
                         assert np.isfinite(stepdir).all()
                         shs = .5 * stepdir.dot(fisher_vector_product(stepdir))
                         # abs(shs) to avoid taking square root of negative
@@ -561,17 +509,16 @@ class TRPO(ActorCriticRLModel):
                                 self.loss_names, mean_losses):
                             logger.record_tabular(loss_name, loss_val)
 
-                    with self.timed("vf"):
-                        for _ in range(self.vf_iters):
-                            # NOTE: for recurrent policies, use shuffle=False?
-                            for (mbob, mbret) in dataset.iterbatches(
-                                    (seg["observations"], seg["tdlamret"]),
-                                    include_final_partial_batch=False,
-                                    batch_size=128,
-                                    shuffle=True):
-                                grad = self.allmean(self.compute_vflossandgrad(
-                                    mbob, mbob, mbret, sess=self.sess))
-                                self.vfadam.update(grad, self.vf_stepsize)
+                    for _ in range(self.vf_iters):
+                        # NOTE: for recurrent policies, use shuffle=False?
+                        for (mbob, mbret) in dataset.iterbatches(
+                                (seg["observations"], seg["tdlamret"]),
+                                include_final_partial_batch=False,
+                                batch_size=128,
+                                shuffle=True):
+                            grad = self.allmean(self.compute_vflossandgrad(
+                                mbob, mbob, mbret, sess=self.sess))
+                            self.vfadam.update(grad, self.vf_stepsize)
 
                     logger.record_tabular(
                         "explained_variance_tdlam_before",
