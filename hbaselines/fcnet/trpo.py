@@ -3,6 +3,7 @@ import tensorflow as tf
 import numpy as np
 import os
 import csv
+import random
 from collections import deque
 
 from hbaselines.utils.tf_util import make_session
@@ -158,16 +159,19 @@ class TRPO(ActorCriticRLModel):
                  policy_kwargs=None,
                  seed=None,
                  n_cpu_tf_sess=1):
-        super(TRPO, self).__init__(
-            policy=policy,
-            env=env,
-            verbose=verbose,
-            requires_vec_env=False,
-            _init_setup_model=_init_setup_model,
-            policy_kwargs=policy_kwargs,
-            seed=seed,
-            n_cpu_tf_sess=n_cpu_tf_sess,
-        )
+        self.policy = policy
+        self.env = env
+        self.verbose = verbose
+        # self._requires_vec_env = False
+        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.n_envs = None
+        self._vectorize_action = False
+        self.num_timesteps = 0
+        self.params = None
+        self.seed = seed
+        self.n_cpu_tf_sess = n_cpu_tf_sess
 
         num_envs = 1
 
@@ -220,7 +224,10 @@ class TRPO(ActorCriticRLModel):
 
         self.graph = tf.Graph()
         with self.graph.as_default():
-            self.set_random_seed(self.seed)
+            tf.set_random_seed(self.seed)
+            np.random.seed(self.seed)
+            random.seed(self.seed)
+
             self.sess = make_session(
                 num_cpu=self.n_cpu_tf_sess, graph=self.graph)
 
@@ -341,12 +348,6 @@ class TRPO(ActorCriticRLModel):
               log_interval=100,
               tb_log_name="TRPO",
               reset_num_timesteps=True):
-
-        # setup_learn
-        if self.episode_reward is None:
-            self.episode_reward = np.zeros((self.n_envs,))
-        if self.ep_info_buf is None:
-            self.ep_info_buf = deque(maxlen=100)
 
         with self.sess.as_default():
             seg_gen = traj_segment_generator(
@@ -558,703 +559,197 @@ class TRPO(ActorCriticRLModel):
 # =========================================================================== #
 
 """TRPO-compatible feedforward policy."""
-import numpy as np
-import tensorflow as tf
 
-from hbaselines.base_policies import Policy
-from hbaselines.utils.tf_util import create_fcnet
-from hbaselines.utils.tf_util import create_conv
-from hbaselines.utils.tf_util import get_trainable_vars
-from hbaselines.utils.tf_util import explained_variance
-from hbaselines.utils.tf_util import print_params_shape
-from hbaselines.utils.tf_util import process_minibatch
+from stable_baselines.common.policies import mlp_extractor
+from stable_baselines.common.policies import linear
+from stable_baselines.common.policies import make_proba_dist_type
+from stable_baselines.common.policies import observation_input
+from gym.spaces import Discrete
 
 
-class FeedForwardPolicy(Policy):
-    """Feed-forward neural network policy.
-
-    Attributes
-    ----------
-    learning_rate : float
-        the learning rate
-    n_minibatches : int
-        number of training minibatches per update
-    n_opt_epochs : int
-        number of training epochs per update procedure
-    gamma : float
-        the discount factor
-    lam : float
-        factor for trade-off of bias vs variance for Generalized Advantage
-        Estimator
-    ent_coef : float
-        entropy coefficient for the loss calculation
-    vf_coef : float
-        value function coefficient for the loss calculation
-    max_grad_norm : float
-        the maximum value for the gradient clipping
-    cliprange : float or callable
-        clipping parameter, it can be a function
-    cliprange_vf : float or callable
-        clipping parameter for the value function, it can be a function. This
-        is a parameter specific to the OpenAI implementation. If None is passed
-        (default), then `cliprange` (that is used for the policy) will be used.
-        IMPORTANT: this clipping depends on the reward scaling. To deactivate
-        value function clipping (and recover the original PPO implementation),
-        you have to pass a negative value (e.g. -1).
-    num_envs : int
-        number of environments used to run simulations in parallel.
-    mb_rewards : array_like
-        a minibatch of environment rewards
-    mb_obs : array_like
-        a minibatch of observations
-    mb_contexts : array_like
-        a minibatch of contextual terms
-    mb_actions : array_like
-        a minibatch of actions
-    mb_values : array_like
-        a minibatch of estimated values by the policy
-    mb_neglogpacs : array_like
-        a minibatch of the negative log-likelihood of performed actions
-    mb_dones : array_like
-        a minibatch of done masks
-    mb_all_obs : array_like
-        a minibatch of full-state observations
-    mb_returns : array_like
-        a minibatch of expected discounted returns
-    last_obs : array_like
-        the most recent observation from each environment. Used to compute the
-        GAE terms.
-    mb_advs : array_like
-        a minibatch of estimated advantages
-    rew_ph : tf.compat.v1.placeholder
-        placeholder for the rewards / discounted returns
-    action_ph : tf.compat.v1.placeholder
-        placeholder for the actions
-    obs_ph : tf.compat.v1.placeholder
-        placeholder for the observations
-    advs_ph : tf.compat.v1.placeholder
-        placeholder for the advantages
-    old_neglog_pac_ph : tf.compat.v1.placeholder
-        placeholder for the negative-log probability of the actions that were
-        performed
-    old_vpred_ph : tf.compat.v1.placeholder
-        placeholder for the current predictions of the values of given states
-    phase_ph : tf.compat.v1.placeholder
-        a placeholder that defines whether training is occurring for the batch
-        normalization layer. Set to True in training and False in testing.
-    rate_ph : tf.compat.v1.placeholder
-        the probability that each element is dropped if dropout is implemented
-    action : tf.Variable
-        the output from the policy/actor
-    pi_mean : tf.Variable
-        the output from the policy's mean term
-    pi_logstd : tf.Variable
-        the output from the policy's log-std term
-    pi_std : tf.Variable
-        the expnonential of the pi_logstd term
-    neglogp : tf.Variable
-        a differentiable form of the negative log-probability of actions by the
-        current policy
-    value_fn : tf.Variable
-        the output from the value function
-    value_flat : tf.Variable
-        a one-dimensional (vector) version of value_fn
-    entropy : tf.Variable
-        computes the entropy of actions performed by the policy
-    vf_loss : tf.Variable
-        the output from the computed value function loss of a batch of data
-    pg_loss : tf.Variable
-        the output from the computed policy gradient loss of a batch of data
-    approxkl : tf.Variable
-        computes the KL-divergence between two models
-    loss : tf.Variable
-        the output from the computed loss of a batch of data
-    optimizer : tf.Operation
-        the operation that updates the trainable parameters of the actor
+class FeedForwardPolicy(object):
     """
+    Policy object that implements actor critic, using a feed forward neural
+    network.
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param reuse: (bool) If the policy is reusable or not
+    :param layers: ([int]) (deprecated, use net_arch instead) The size of the
+        Neural network for the policy (if None, default to [64, 64])
+    :param net_arch: (list) Specification of the actor-critic policy network
+        architecture (see mlp_extractor documentation for details).
+    :param act_fun: (tf.func) the activation function to use in the neural
+        network.
+    """
+
+    recurrent = False
 
     def __init__(self,
                  sess,
                  ob_space,
                  ac_space,
-                 co_space,
-                 verbose,
-                 learning_rate,
-                 model_params,
-                 n_minibatches,
-                 n_opt_epochs,
-                 gamma,
-                 lam,
-                 ent_coef,
-                 vf_coef,
-                 max_grad_norm,
-                 cliprange,
-                 cliprange_vf,
-                 l2_penalty,
-                 scope=None,
-                 num_envs=1):
-        """Instantiate the policy object.
+                 n_env,
+                 n_steps,
+                 n_batch,
+                 reuse=False,
+                 layers=None,
+                 net_arch=None,
+                 act_fun=tf.tanh):
+        self.n_env = n_env
+        self.n_steps = n_steps
+        self.n_batch = n_batch
+        with tf.variable_scope("input", reuse=False):
+            self._obs_ph, self._processed_obs = observation_input(
+                ob_space, n_batch, scale=False)
+            self._action_ph = None
+        self.sess = sess
+        self.reuse = reuse
+        self.ob_space = ob_space
+        self.ac_space = ac_space
 
-        Parameters
-        ----------
-        sess : tf.compat.v1.Session
-            the current TensorFlow session
-        ob_space : gym.spaces.*
-            the observation space of the environment
-        ac_space : gym.spaces.*
-            the action space of the environment
-        co_space : gym.spaces.*
-            the context space of the environment
-        verbose : int
-            the verbosity level: 0 none, 1 training information, 2 tensorflow
-            debug
-        l2_penalty : float
-            L2 regularization penalty. This is applied to the policy network.
-        model_params : dict
-            dictionary of model-specific parameters. See parent class.
-        learning_rate : float
-            the learning rate
-        n_minibatches : int
-            number of training minibatches per update
-        n_opt_epochs : int
-            number of training epochs per update procedure
-        gamma : float
-            the discount factor
-        lam : float
-            factor for trade-off of bias vs variance for Generalized Advantage
-            Estimator
-        ent_coef : float
-            entropy coefficient for the loss calculation
-        vf_coef : float
-            value function coefficient for the loss calculation
-        max_grad_norm : float
-            the maximum value for the gradient clipping
-        cliprange : float or callable
-            clipping parameter, it can be a function
-        cliprange_vf : float or callable
-            clipping parameter for the value function, it can be a function.
-            This is a parameter specific to the OpenAI implementation. If None
-            is passed (default), then `cliprange` (that is used for the policy)
-            will be used. IMPORTANT: this clipping depends on the reward
-            scaling. To deactivate value function clipping (and recover the
-            original PPO implementation), you have to pass a negative value
-            (e.g. -1).
-        """
-        super(FeedForwardPolicy, self).__init__(
-            sess=sess,
-            ob_space=ob_space,
-            ac_space=ac_space,
-            co_space=co_space,
-            verbose=verbose,
-            l2_penalty=l2_penalty,
-            model_params=model_params,
-            num_envs=num_envs,
-        )
+        self._pdtype = make_proba_dist_type(ac_space)
+        self._policy = None
+        self._proba_distribution = None
+        self._value_fn = None
+        self._action = None
+        self._deterministic_action = None
 
-        self.learning_rate = learning_rate
-        self.n_minibatches = n_minibatches
-        self.n_opt_epochs = n_opt_epochs
-        self.gamma = gamma
-        self.lam = lam
-        self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
-        self.max_grad_norm = max_grad_norm
-        self.cliprange = cliprange
-        self.cliprange_vf = cliprange_vf
+        if net_arch is None:
+            if layers is None:
+                layers = [64, 64]
+            net_arch = [dict(vf=layers, pi=layers)]
 
-        # Create variables to store on-policy data.
-        self.mb_rewards = [[] for _ in range(num_envs)]
-        self.mb_obs = [[] for _ in range(num_envs)]
-        self.mb_contexts = [[] for _ in range(num_envs)]
-        self.mb_actions = [[] for _ in range(num_envs)]
-        self.mb_values = [[] for _ in range(num_envs)]
-        self.mb_neglogpacs = [[] for _ in range(num_envs)]
-        self.mb_dones = [[] for _ in range(num_envs)]
-        self.mb_all_obs = [[] for _ in range(num_envs)]
-        self.mb_returns = [[] for _ in range(num_envs)]
-        self.last_obs = [None for _ in range(num_envs)]
-        self.mb_advs = None
+        with tf.variable_scope("model", reuse=reuse):
+            pi_latent, vf_latent = mlp_extractor(
+                tf.layers.flatten(self.processed_obs), net_arch, act_fun)
 
-        # Compute the shape of the input observation space, which may include
-        # the contextual term.
-        ob_dim = self._get_ob_dim(ob_space, co_space)
+            self._value_fn = linear(vf_latent, 'vf', 1)
 
-        # =================================================================== #
-        # Step 1: Create input variables.                                     #
-        # =================================================================== #
+            self._proba_distribution, self._policy, self.q_value = \
+                self.pdtype.proba_distribution_from_latent(
+                    pi_latent, vf_latent, init_scale=0.01)
 
-        with tf.compat.v1.variable_scope("input", reuse=False):
-            self.rew_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,),
-                name='rewards')
-            self.action_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,) + ac_space.shape,
-                name='actions')
-            self.obs_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,) + ob_dim,
-                name='obs0')
-            self.advs_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,),
-                name="advs_ph")
-            self.old_neglog_pac_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,),
-                name="old_neglog_pac_ph")
-            self.old_vpred_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,),
-                name="old_vpred_ph")
-            self.phase_ph = tf.compat.v1.placeholder(
-                tf.bool,
-                name='phase')
-            self.rate_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                name='rate')
+        self._setup_init()
 
-        # =================================================================== #
-        # Step 2: Create actor and critic variables.                          #
-        # =================================================================== #
-
-        # Create networks and core TF parts that are shared across setup parts.
-        with tf.variable_scope("model", reuse=False):
-            # Create the policy.
-            self.action, self.pi_mean, self.pi_logstd = self.make_actor(
-                self.obs_ph, scope="pi")
-            self.pi_std = tf.exp(self.pi_logstd)
-
-            # Create a method the log-probability of current actions.
-            self.neglogp = self._neglogp(self.action)
-
-            # Create the value function.
-            self.value_fn = self.make_critic(self.obs_ph, scope="vf")
-            self.value_flat = self.value_fn[:, 0]
-
-        # =================================================================== #
-        # Step 4: Setup the optimizers for the actor and critic.              #
-        # =================================================================== #
-
-        self.entropy = None
-        self.vf_loss = None
-        self.pg_loss = None
-        self.approxkl = None
-        self.loss = None
-        self.optimizer = None
-
-        with tf.compat.v1.variable_scope("Optimizer", reuse=False):
-            self._setup_optimizers(scope)
-
-        # =================================================================== #
-        # Step 5: Setup the operations for computing model statistics.        #
-        # =================================================================== #
-
-        self._setup_stats(scope or "Model")
-
-    def make_actor(self, obs, reuse=False, scope="pi"):
-        """Create an actor tensor.
-
-        Parameters
-        ----------
-        obs : tf.compat.v1.placeholder
-            the input observation placeholder
-        reuse : bool
-            whether or not to reuse parameters
-        scope : str
-            the scope name of the actor
-
-        Returns
-        -------
-        tf.Variable
-            the output from the actor
-        """
-        # Initial image pre-processing (for convolutional policies).
-        if self.model_params["model_type"] == "conv":
-            pi_h = create_conv(
-                obs=obs,
-                image_height=self.model_params["image_height"],
-                image_width=self.model_params["image_width"],
-                image_channels=self.model_params["image_channels"],
-                ignore_flat_channels=self.model_params["ignore_flat_channels"],
-                ignore_image=self.model_params["ignore_image"],
-                filters=self.model_params["filters"],
-                kernel_sizes=self.model_params["kernel_sizes"],
-                strides=self.model_params["strides"],
-                act_fun=self.model_params["act_fun"],
-                layer_norm=self.model_params["layer_norm"],
-                batch_norm=self.model_params["batch_norm"],
-                phase=self.phase_ph,
-                dropout=self.model_params["dropout"],
-                rate=self.rate_ph,
-                scope=scope,
-                reuse=reuse,
-            )
+    def step(self, obs, state=None, mask=None, deterministic=False):
+        if deterministic:
+            action, value, neglogp = self.sess.run(
+                [self.deterministic_action, self.value_flat, self.neglogp],
+                {self.obs_ph: obs})
         else:
-            pi_h = obs
+            action, value, neglogp = self.sess.run(
+                [self.action, self.value_flat, self.neglogp],
+                {self.obs_ph: obs})
+        return action, value, self.initial_state, neglogp
 
-        # Create the output mean.
-        policy_mean = create_fcnet(
-            obs=pi_h,
-            layers=self.model_params["layers"],
-            num_output=self.ac_space.shape[0],
-            stochastic=False,
-            act_fun=self.model_params["act_fun"],
-            layer_norm=self.model_params["layer_norm"],
-            batch_norm=self.model_params["batch_norm"],
-            phase=self.phase_ph,
-            dropout=self.model_params["dropout"],
-            rate=self.rate_ph,
-            scope=scope,
-            reuse=reuse,
-        )
+    def proba_step(self, obs, state=None, mask=None):
+        return self.sess.run(self.policy_proba, {self.obs_ph: obs})
 
-        # Create the output log_std.
-        log_std = tf.get_variable(
-            name='logstd',
-            shape=[1, self.ac_space.shape[0]],
-            initializer=tf.zeros_initializer()
-        )
+    def value(self, obs, state=None, mask=None):
+        return self.sess.run(self.value_flat, {self.obs_ph: obs})
 
-        # Create a method to sample from the distribution.
-        std = tf.exp(log_std)
-        action = policy_mean + std * tf.random_normal(
-            shape=tf.shape(policy_mean),
-            dtype=tf.float32
-        )
+    def _setup_init(self):
+        """Sets up the distributions, actions, and value."""
+        with tf.variable_scope("output", reuse=True):
+            assert self.policy is not None and self.proba_distribution \
+                is not None and self.value_fn is not None
+            self._action = self.proba_distribution.sample()
+            self._deterministic_action = self.proba_distribution.mode()
+            self._neglogp = self.proba_distribution.neglogp(self.action)
+            self._policy_proba = [self.proba_distribution.mean,
+                                  self.proba_distribution.std]
+            self._value_flat = self.value_fn[:, 0]
 
-        return action, policy_mean, log_std
+    @property
+    def pdtype(self):
+        """ProbabilityDistributionType: type of the distribution for stochastic
+        actions."""
+        return self._pdtype
 
-    def make_critic(self, obs, reuse=False, scope="qf"):
-        """Create a critic tensor.
+    @property
+    def policy(self):
+        """tf.Tensor: policy output, e.g. logits."""
+        return self._policy
 
-        Parameters
-        ----------
-        obs : tf.compat.v1.placeholder
-            the input observation placeholder
-        reuse : bool
-            whether or not to reuse parameters
-        scope : str
-            the scope name of the actor
+    @property
+    def proba_distribution(self):
+        """ProbabilityDistribution: distribution of stochastic actions."""
+        return self._proba_distribution
 
-        Returns
-        -------
-        tf.Variable
-            the output from the critic
+    @property
+    def value_fn(self):
+        """tf.Tensor: value estimate, of shape (self.n_batch, 1)"""
+        return self._value_fn
+
+    @property
+    def value_flat(self):
+        """tf.Tensor: value estimate, of shape (self.n_batch, )"""
+        return self._value_flat
+
+    @property
+    def action(self):
+        """tf.Tensor: stochastic action, of shape (self.n_batch, ) +
+        self.ac_space.shape."""
+        return self._action
+
+    @property
+    def deterministic_action(self):
+        """tf.Tensor: deterministic action, of shape (self.n_batch, ) +
+        self.ac_space.shape."""
+        return self._deterministic_action
+
+    @property
+    def neglogp(self):
+        """tf.Tensor: negative log likelihood of the action sampled by
+        self.action."""
+        return self._neglogp
+
+    @property
+    def policy_proba(self):
+        """tf.Tensor: parameters of the probability distribution. Depends on
+        pdtype."""
+        return self._policy_proba
+
+    @property
+    def is_discrete(self):
+        """bool: is action space discrete."""
+        return isinstance(self.ac_space, Discrete)
+
+    @property
+    def initial_state(self):
         """
-        # Initial image pre-processing (for convolutional policies).
-        if self.model_params["model_type"] == "conv":
-            vf_h = create_conv(
-                obs=obs,
-                image_height=self.model_params["image_height"],
-                image_width=self.model_params["image_width"],
-                image_channels=self.model_params["image_channels"],
-                ignore_flat_channels=self.model_params["ignore_flat_channels"],
-                ignore_image=self.model_params["ignore_image"],
-                filters=self.model_params["filters"],
-                kernel_sizes=self.model_params["kernel_sizes"],
-                strides=self.model_params["strides"],
-                act_fun=self.model_params["act_fun"],
-                layer_norm=self.model_params["layer_norm"],
-                batch_norm=self.model_params["batch_norm"],
-                phase=self.phase_ph,
-                dropout=self.model_params["dropout"],
-                rate=self.rate_ph,
-                scope=scope,
-                reuse=reuse,
-            )
-        else:
-            vf_h = obs
-
-        return create_fcnet(
-            obs=vf_h,
-            layers=self.model_params["layers"],
-            num_output=1,
-            stochastic=False,
-            act_fun=self.model_params["act_fun"],
-            layer_norm=self.model_params["layer_norm"],
-            batch_norm=self.model_params["batch_norm"],
-            phase=self.phase_ph,
-            dropout=self.model_params["dropout"],
-            rate=self.rate_ph,
-            scope=scope,
-            reuse=reuse,
-        )
-
-    def _neglogp(self, x):
-        """Compute the negative log-probability of an input action (x)."""
-        return 0.5 * tf.reduce_sum(
-            tf.square((x - self.pi_mean) / self.pi_std), axis=-1) \
-            + 0.5 * np.log(2.0 * np.pi) \
-            * tf.cast(tf.shape(x)[-1], tf.float32) \
-            + tf.reduce_sum(self.pi_logstd, axis=-1)
-
-    def _setup_optimizers(self, scope):
-        """Create the actor and critic optimizers."""
-        pass  # TODO
-
-    def _setup_stats(self, base):
-        """Create the running means and std of the model inputs and outputs.
-
-        This method also adds the same running means and stds as scalars to
-        tensorboard for additional storage.
+        The initial state of the policy. For feedforward policies, None. For a
+        recurrent policy,
+        a NumPy array of shape (self.n_env, ) + state_shape.
         """
-        ops = {
-            'reference_action_mean': tf.reduce_mean(self.pi_mean),
-            'reference_action_std': tf.reduce_mean(self.pi_logstd),
-            'rewards': tf.reduce_mean(self.rew_ph),
-            'advantage': tf.reduce_mean(self.advs_ph),
-            'old_neglog_action_probability': tf.reduce_mean(
-                self.old_neglog_pac_ph),
-            'old_value_pred': tf.reduce_mean(self.old_vpred_ph),
-            'entropy_loss': self.entropy,
-            'policy_gradient_loss': self.pg_loss,
-            'value_function_loss': self.vf_loss,
-            'approximate_kullback-leibler': self.approxkl,
-            'clip_factor': self.clipfrac,
-            'loss': self.loss,
-            'explained_variance': explained_variance(
-                self.old_vpred_ph, self.rew_ph)
-        }
+        assert not self.recurrent, "When using recurrent policies, you must " \
+                                   "overwrite `initial_state()` method"
+        return None
 
-        tf.summary.scalar(
-            'discounted_rewards', tf.reduce_mean(ret))
-        tf.summary.scalar(
-            'learning_rate', tf.reduce_mean(self.vf_stepsize))
-        tf.summary.scalar(
-            'advantage', tf.reduce_mean(atarg))
-        tf.summary.scalar(
-            'kl_clip_range', tf.reduce_mean(self.max_kl))
+    @property
+    def obs_ph(self):
+        """tf.Tensor: placeholder for observations, shape (self.n_batch, )
+        + self.ob_space.shape."""
+        return self._obs_ph
 
-        tf.summary.scalar('entropy_loss', meanent)
-        tf.summary.scalar('policy_gradient_loss', optimgain)
-        tf.summary.scalar('value_function_loss', surrgain)
-        tf.summary.scalar('approximate_kullback-leibler', meankl)
-        tf.summary.scalar(
-            'loss',
-            optimgain + meankl + entbonus + surrgain + meanent)
+    @property
+    def processed_obs(self):
+        """tf.Tensor: processed observations, shape (self.n_batch, ) +
+        self.ob_space.shape.
 
-        # Add all names and ops to the tensorboard summary.
-        for key in ops.keys():
-            name = "{}/{}".format(base, key)
-            op = ops[key]
-            tf.compat.v1.summary.scalar(name, op)
+        The form of processing depends on the type of the observation space,
+        and the parameters
+        whether scale is passed to the constructor; see observation_input for
+        more information."""
+        return self._processed_obs
 
-    def initialize(self):
-        """See parent class."""
-        pass
-
-    def get_action(self, obs, context, apply_noise, random_actions, env_num=0):
-        """See parent class."""
-        # Add the contextual observation, if applicable.
-        obs = self._get_obs(obs, context, axis=1)
-
-        action, values, neglogpacs = self.sess.run(
-            [self.action if apply_noise else self.pi_mean,
-             self.value_flat, self.neglogp],
-            feed_dict={
-                self.obs_ph: obs,
-                self.phase_ph: 0,
-                self.rate_ph: 0.0,
-            }
-        )
-
-        # Store information on the values and negative-log likelihood.
-        self.mb_values[env_num].append(values)
-        self.mb_neglogpacs[env_num].append(neglogpacs)
-
-        return action
-
-    def store_transition(self, obs0, context0, action, reward, obs1, context1,
-                         done, is_final_step, env_num=0, evaluate=False):
-        """Store a transition in the replay buffer.
-
-        Parameters
-        ----------
-        obs0 : array_like
-            the last observation
-        context0 : array_like or None
-            the last contextual term. Set to None if no context is provided by
-            the environment.
-        action : array_like
-            the action
-        reward : float
-            the reward
-        obs1 : array_like
-            the current observation
-        context1 : array_like or None
-            the current contextual term. Set to None if no context is provided
-            by the environment.
-        done : float
-            is the episode done
-        is_final_step : bool
-            whether the time horizon was met in the step corresponding to the
-            current sample. This is used by the TD3 algorithm to augment the
-            done mask.
-        env_num : int
-            the environment number. Used to handle situations when multiple
-            parallel environments are being used.
-        evaluate : bool
-            whether the sample is being provided by the evaluation environment.
-            If so, the data is not stored in the replay buffer.
-        """
-        # Update the minibatch of samples.
-        self.mb_rewards[env_num].append(reward)
-        self.mb_obs[env_num].append(obs0.reshape(1, -1))
-        self.mb_contexts[env_num].append(context0)
-        self.mb_actions[env_num].append(action.reshape(1, -1))
-        self.mb_dones[env_num].append(done)
-
-        # Update the last observation (to compute the last value for the GAE
-        # expected returns).
-        self.last_obs[env_num] = self._get_obs([obs1], context1)
-
-    def update(self, **kwargs):
-        """See parent class."""
-        # Compute the last estimated value.
-        last_values = [
-            self.sess.run(
-                self.value_flat,
-                feed_dict={
-                    self.obs_ph: self.last_obs[env_num],
-                    self.phase_ph: 0,
-                    self.rate_ph: 0.0,
-                })
-            for env_num in range(self.num_envs)
-        ]
-
-        (self.mb_obs,
-         self.mb_contexts,
-         self.mb_actions,
-         self.mb_values,
-         self.mb_neglogpacs,
-         self.mb_all_obs,
-         self.mb_rewards,
-         self.mb_returns,
-         self.mb_dones,
-         self.mb_advs, n_steps) = process_minibatch(
-            mb_obs=self.mb_obs,
-            mb_contexts=self.mb_contexts,
-            mb_actions=self.mb_actions,
-            mb_values=self.mb_values,
-            mb_neglogpacs=self.mb_neglogpacs,
-            mb_all_obs=self.mb_all_obs,
-            mb_rewards=self.mb_rewards,
-            mb_returns=self.mb_returns,
-            mb_dones=self.mb_dones,
-            last_values=last_values,
-            gamma=self.gamma,
-            lam=self.lam,
-            num_envs=self.num_envs,
-        )
-
-        # Run the optimization procedure.
-        batch_size = n_steps // self.n_minibatches
-
-        inds = np.arange(n_steps)
-        for _ in range(self.n_opt_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, n_steps, batch_size):
-                end = start + batch_size
-                mbinds = inds[start:end]
-                self.update_from_batch(
-                    obs=self.mb_obs[mbinds],
-                    context=None if self.mb_contexts[0] is None
-                    else self.mb_contexts[mbinds],
-                    returns=self.mb_returns[mbinds],
-                    actions=self.mb_actions[mbinds],
-                    values=self.mb_values[mbinds],
-                    advs=self.mb_advs[mbinds],
-                    neglogpacs=self.mb_neglogpacs[mbinds],
-                )
-
-    def update_from_batch(self,
-                          obs,
-                          context,
-                          returns,
-                          actions,
-                          values,
-                          advs,
-                          neglogpacs):
-        """Perform gradient update step given a batch of data.
-
-        Parameters
-        ----------
-        obs : array_like
-            a minibatch of observations
-        context : array_like
-            a minibatch of contextual terms
-        returns : array_like
-            a minibatch of contextual expected discounted returns
-        actions : array_like
-            a minibatch of actions
-        values : array_like
-            a minibatch of estimated values by the policy
-        advs : array_like
-            a minibatch of estimated advantages
-        neglogpacs : array_like
-            a minibatch of the negative log-likelihood of performed actions
-        """
-        # Add the contextual observation, if applicable.
-        obs = self._get_obs(obs, context, axis=1)
-
-        return self.sess.run(self.optimizer, {
-            self.obs_ph: obs,
-            self.action_ph: actions,
-            self.advs_ph: advs,
-            self.rew_ph: returns,
-            self.old_neglog_pac_ph: neglogpacs,
-            self.old_vpred_ph: values,
-            self.phase_ph: 1,
-            self.rate_ph: 0.5,
-        })
-
-    def get_td_map(self):
-        """See parent class."""
-        # Add the contextual observation, if applicable.
-        context = None if self.mb_contexts[0] is None else self.mb_contexts
-        obs = self._get_obs(self.mb_obs, context, axis=1)
-
-        td_map = self.get_td_map_from_batch(
-            obs=obs.copy(),
-            mb_actions=self.mb_actions,
-            mb_advs=self.mb_advs,
-            mb_returns=self.mb_returns,
-            mb_neglogpacs=self.mb_neglogpacs,
-            mb_values=self.mb_values,
-        )
-
-        # Clear memory
-        self.mb_rewards = [[] for _ in range(self.num_envs)]
-        self.mb_obs = [[] for _ in range(self.num_envs)]
-        self.mb_contexts = [[] for _ in range(self.num_envs)]
-        self.mb_actions = [[] for _ in range(self.num_envs)]
-        self.mb_values = [[] for _ in range(self.num_envs)]
-        self.mb_neglogpacs = [[] for _ in range(self.num_envs)]
-        self.mb_dones = [[] for _ in range(self.num_envs)]
-        self.mb_all_obs = [[] for _ in range(self.num_envs)]
-        self.mb_returns = [[] for _ in range(self.num_envs)]
-        self.last_obs = [None for _ in range(self.num_envs)]
-        self.mb_advs = None
-
-        return td_map
-
-    def get_td_map_from_batch(self,
-                              obs,
-                              mb_actions,
-                              mb_advs,
-                              mb_returns,
-                              mb_neglogpacs,
-                              mb_values):
-        """Convert a batch to a td_map."""
-        return {
-            self.obs_ph: obs,
-            self.action_ph: mb_actions,
-            self.advs_ph: mb_advs,
-            self.rew_ph: mb_returns,
-            self.old_neglog_pac_ph: mb_neglogpacs,
-            self.old_vpred_ph: mb_values,
-            self.phase_ph: 0,
-            self.rate_ph: 0.0,
-        }
+    @property
+    def action_ph(self):
+        """tf.Tensor: placeholder for actions, shape (self.n_batch, ) +
+        self.ac_space.shape."""
+        return self._action_ph
