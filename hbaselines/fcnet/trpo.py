@@ -22,23 +22,29 @@ def iterbatches(arrays,
                 shuffle=True,
                 include_final_partial_batch=True):
     """
-    Iterates over arrays in batches, must provide either num_batches or batch_size, the other must be None.
+    Iterates over arrays in batches, must provide either num_batches or
+    batch_size, the other must be None.
 
     :param arrays: (tuple) a tuple of arrays
-    :param num_batches: (int) the number of batches, must be None is batch_size is defined
-    :param batch_size: (int) the size of the batch, must be None is num_batches is defined
+    :param num_batches: (int) the number of batches, must be None is batch_size
+        is defined
+    :param batch_size: (int) the size of the batch, must be None is num_batches
+        is defined
     :param shuffle: (bool) enable auto shuffle
-    :param include_final_partial_batch: (bool) add the last batch if not the same size as the batch_size
+    :param include_final_partial_batch: (bool) add the last batch if not the
+        same size as the batch_size
     :return: (tuples) a tuple of a batch of the arrays
     """
-    assert (num_batches is None) != (batch_size is None), 'Provide num_batches or batch_size, but not both'
+    assert (num_batches is None) != (batch_size is None), \
+        'Provide num_batches or batch_size, but not both'
     arrays = tuple(map(np.asarray, arrays))
     n_samples = arrays[0].shape[0]
     assert all(a.shape[0] == n_samples for a in arrays[1:])
     inds = np.arange(n_samples)
     if shuffle:
         np.random.shuffle(inds)
-    sections = np.arange(0, n_samples, batch_size)[1:] if num_batches is None else num_batches
+    sections = np.arange(0, n_samples, batch_size)[1:] \
+        if num_batches is None else num_batches
     for batch_inds in np.array_split(inds, sections):
         if include_final_partial_batch or len(batch_inds) == batch_size:
             yield tuple(a[batch_inds] for a in arrays)
@@ -50,15 +56,20 @@ def traj_segment_generator(policy,
                            reward_giver=None,
                            gail=False):
     """
-    Compute target value using TD(lambda) estimator, and advantage with GAE(lambda)
+    Compute target value using TD(lambda) estimator, and advantage with
+    GAE(lambda)
+
     :param policy: (MLPPolicy) the policy
     :param env: (Gym Environment) the environment
     :param horizon: (int) the number of timesteps to run per batch
-    :param reward_giver: (TransitionClassifier) the reward predicter from obsevation and action
-    :param gail: (bool) Whether we are using this generator for standard trpo or with gail
+    :param reward_giver: (TransitionClassifier) the reward predicter from
+        obsevation and action
+    :param gail: (bool) Whether we are using this generator for standard trpo
+        or with gail
     :return: (dict) generator that returns a dict with the following keys:
         - observations: (np.ndarray) observations
-        - rewards: (numpy float) rewards (if gail is used it is the predicted reward)
+        - rewards: (numpy float) rewards (if gail is used it is the predicted
+          reward)
         - true_rewards: (numpy float) if gail is used it is the original reward
         - vpred: (numpy float) action logits
         - dones: (numpy bool) dones (is end of episode, used for logging)
@@ -71,16 +82,18 @@ def traj_segment_generator(policy,
         - ep_true_rets: (float) the real environment reward
     """
     # Check when using GAIL
-    assert not (gail and reward_giver is None), "You must pass a reward giver when using GAIL"
+    assert not (gail and reward_giver is None), \
+        "You must pass a reward giver when using GAIL"
 
     # Initialize state variables
     step = 0
-    action = env.action_space.sample()  # not used, just so we have the datatype
+    # not used, just so we have the datatype
+    action = env.action_space.sample()
     observation = env.reset()
 
     cur_ep_ret = 0  # return in current episode
     current_it_len = 0  # len of current iteration
-    current_ep_len = 0 # len of current episode
+    current_ep_len = 0  # len of current episode
     cur_ep_true_ret = 0
     ep_true_rets = []
     ep_rets = []  # returns of completed episodes in this segment
@@ -94,12 +107,13 @@ def traj_segment_generator(policy,
     episode_starts = np.zeros(horizon, 'bool')
     dones = np.zeros(horizon, 'bool')
     actions = np.array([action for _ in range(horizon)])
-    states = policy.initial_state
+    states = None
     episode_start = True  # marks if we're on first timestep of an episode
     done = False
 
     while True:
-        action, vpred, states, _ = policy.step(observation.reshape(-1, *observation.shape), states, done)
+        action, vpred, states, _ = policy.step(observation.reshape(
+            -1, *observation.shape), states, done)
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
@@ -119,7 +133,8 @@ def traj_segment_generator(policy,
                     "total_timestep": current_it_len,
                     'continue_training': True
             }
-            _, vpred, _, _ = policy.step(observation.reshape(-1, *observation.shape))
+            _, vpred, _, _ = policy.step(
+                observation.reshape(-1, *observation.shape))
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
@@ -136,7 +151,8 @@ def traj_segment_generator(policy,
         clipped_action = action
         # Clip the actions to avoid out of bound error
         if isinstance(env.action_space, gym.spaces.Box):
-            clipped_action = np.clip(action, env.action_space.low, env.action_space.high)
+            clipped_action = np.clip(
+                action, env.action_space.low, env.action_space.high)
 
         if gail:
             reward = reward_giver.get_reward(observation, clipped_action[0])
@@ -174,13 +190,16 @@ def traj_segment_generator(policy,
 
 def add_vtarg_and_adv(seg, gamma, lam):
     """
-    Compute target value using TD(lambda) estimator, and advantage with GAE(lambda)
+    Compute target value using TD(lambda) estimator, and advantage with GAE
+    (lambda)
 
-    :param seg: (dict) the current segment of the trajectory (see traj_segment_generator return for more information)
+    :param seg: (dict) the current segment of the trajectory (see
+        traj_segment_generator return for more information)
     :param gamma: (float) Discount factor
     :param lam: (float) GAE factor
     """
-    # last element is only used for last vtarg, but we already zeroed it if last new = 1
+    # last element is only used for last vtarg, but we already zeroed it if
+    # last new = 1
     episode_starts = np.append(seg["episode_starts"], False)
     vpred = np.append(seg["vpred"], seg["nextvpred"])
     rew_len = len(seg["rewards"])
@@ -189,14 +208,17 @@ def add_vtarg_and_adv(seg, gamma, lam):
     lastgaelam = 0
     for step in reversed(range(rew_len)):
         nonterminal = 1 - float(episode_starts[step + 1])
-        delta = rewards[step] + gamma * vpred[step + 1] * nonterminal - vpred[step]
-        seg["adv"][step] = lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        delta = \
+            rewards[step] + gamma * vpred[step + 1] * nonterminal - vpred[step]
+        seg["adv"][step] = \
+            lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
 
 def zipsame(*seqs):
     """
-    Performs a zip function, but asserts that all zipped elements are of the same size
+    Performs a zip function, but asserts that all zipped elements are of the
+    same size
 
     :param seqs: a list of arrays that are zipped together
     :return: the zipped arguments
@@ -866,76 +888,7 @@ def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
         return tf.matmul(input_tensor, weight) + bias
 
 
-class ProbabilityDistribution(object):
-    """
-    Base class for describing a probability distribution.
-    """
-    def __init__(self):
-        super(ProbabilityDistribution, self).__init__()
-
-    def flatparam(self):
-        """
-        Return the direct probabilities
-
-        :return: ([float]) the probabilities
-        """
-        raise NotImplementedError
-
-    def mode(self):
-        """
-        Returns the probability
-
-        :return: (Tensorflow Tensor) the deterministic action
-        """
-        raise NotImplementedError
-
-    def neglogp(self, x):
-        """
-        returns the of the negative log likelihood
-
-        :param x: (str) the labels of each index
-        :return: ([float]) The negative log likelihood of the distribution
-        """
-        # Usually it's easier to define the negative logprob
-        raise NotImplementedError
-
-    def kl(self, other):
-        """
-        Calculates the Kullback-Leibler divergence from the given probability
-        distribution
-
-        :param other: ([float]) the distribution to compare with
-        :return: (float) the KL divergence of the two distributions
-        """
-        raise NotImplementedError
-
-    def entropy(self):
-        """
-        Returns Shannon's entropy of the probability
-
-        :return: (float) the entropy
-        """
-        raise NotImplementedError
-
-    def sample(self):
-        """
-        returns a sample from the probability distribution
-
-        :return: (Tensorflow Tensor) the stochastic action
-        """
-        raise NotImplementedError
-
-    def logp(self, x):
-        """
-        returns the of the log likelihood
-
-        :param x: (str) the labels of each index
-        :return: ([float]) The log likelihood of the distribution
-        """
-        return - self.neglogp(x)
-
-
-class DiagGaussianProbabilityDistribution(ProbabilityDistribution):
+class DiagGaussianProbabilityDistribution(object):
     def __init__(self, flat):
         """
         Probability distributions from multivariate Gaussian input
@@ -950,13 +903,19 @@ class DiagGaussianProbabilityDistribution(ProbabilityDistribution):
         self.std = tf.exp(logstd)
         super(DiagGaussianProbabilityDistribution, self).__init__()
 
-    def flatparam(self):
-        return self.flat
-
     def mode(self):
         # Bounds are taken into account outside this class (during training
         # only)
         return self.mean
+
+    def logp(self, x):
+        """
+        returns the of the log likelihood
+
+        :param x: (str) the labels of each index
+        :return: ([float]) The log likelihood of the distribution
+        """
+        return - self.neglogp(x)
 
     def neglogp(self, x):
         return 0.5 * tf.reduce_sum(
@@ -982,112 +941,9 @@ class DiagGaussianProbabilityDistribution(ProbabilityDistribution):
         return self.mean + self.std * tf.random_normal(
             tf.shape(self.mean), dtype=self.mean.dtype)
 
-    @classmethod
-    def fromflat(cls, flat):
-        """
-        Create an instance of this from new multivariate Gaussian input
 
-        :param flat: ([float]) the multivariate Gaussian input data
-        :return: (ProbabilityDistribution) the instance from the given
-            multivariate Gaussian input data
-        """
-        return cls(flat)
+class DiagGaussianProbabilityDistributionType(object):
 
-
-class ProbabilityDistributionType(object):
-    """
-    Parametrized family of probability distributions
-    """
-
-    def probability_distribution_class(self):
-        """
-        returns the ProbabilityDistribution class of this type
-
-        :return: (Type ProbabilityDistribution) the probability distribution
-            class associated
-        """
-        raise NotImplementedError
-
-    def proba_distribution_from_flat(self, flat):
-        """
-        Returns the probability distribution from flat probabilities
-        flat: flattened vector of parameters of probability distribution
-
-        :param flat: ([float]) the flat probabilities
-        :return: (ProbabilityDistribution) the instance of the
-            ProbabilityDistribution associated
-        """
-        return self.probability_distribution_class()(flat)
-
-    def proba_distribution_from_latent(self,
-                                       pi_latent_vector,
-                                       vf_latent_vector,
-                                       init_scale=1.0,
-                                       init_bias=0.0):
-        """
-        returns the probability distribution from latent values
-
-        :param pi_latent_vector: ([float]) the latent pi values
-        :param vf_latent_vector: ([float]) the latent vf values
-        :param init_scale: (float) the initial scale of the distribution
-        :param init_bias: (float) the initial bias of the distribution
-        :return: (ProbabilityDistribution) the instance of the
-            ProbabilityDistribution associated
-        """
-        raise NotImplementedError
-
-    def param_shape(self):
-        """
-        returns the shape of the input parameters
-
-        :return: ([int]) the shape
-        """
-        raise NotImplementedError
-
-    def sample_shape(self):
-        """
-        returns the shape of the sampling
-
-        :return: ([int]) the shape
-        """
-        raise NotImplementedError
-
-    def sample_dtype(self):
-        """
-        returns the type of the sampling
-
-        :return: (type) the type
-        """
-        raise NotImplementedError
-
-    def param_placeholder(self, prepend_shape, name=None):
-        """
-        returns the TensorFlow placeholder for the input parameters
-
-        :param prepend_shape: ([int]) the prepend shape
-        :param name: (str) the placeholder name
-        :return: (TensorFlow Tensor) the placeholder
-        """
-        return tf.placeholder(
-            dtype=tf.float32,
-            shape=prepend_shape + self.param_shape(),
-            name=name)
-
-    def sample_placeholder(self, prepend_shape, name=None):
-        """
-        returns the TensorFlow placeholder for the sampling
-
-        :param prepend_shape: ([int]) the prepend shape
-        :param name: (str) the placeholder name
-        :return: (TensorFlow Tensor) the placeholder
-        """
-        return tf.placeholder(
-            dtype=self.sample_dtype(),
-            shape=prepend_shape + self.sample_shape(),
-            name=name)
-
-
-class DiagGaussianProbabilityDistributionType(ProbabilityDistributionType):
     def __init__(self, size):
         """
         The probability distribution type for multivariate Gaussian input
@@ -1096,19 +952,6 @@ class DiagGaussianProbabilityDistributionType(ProbabilityDistributionType):
             gaussian
         """
         self.size = size
-
-    def probability_distribution_class(self):
-        return DiagGaussianProbabilityDistribution
-
-    def proba_distribution_from_flat(self, flat):
-        """
-        returns the probability distribution from flat probabilities
-
-        :param flat: ([float]) the flat probabilities
-        :return: (ProbabilityDistribution) the instance of the
-            ProbabilityDistribution associated
-        """
-        return self.probability_distribution_class()(flat)
 
     def proba_distribution_from_latent(self,
                                        pi_latent_vector,
@@ -1129,16 +972,20 @@ class DiagGaussianProbabilityDistributionType(ProbabilityDistributionType):
         q_values = linear(
             vf_latent_vector, 'q', self.size,
             init_scale=init_scale, init_bias=init_bias)
-        return self.proba_distribution_from_flat(pdparam), mean, q_values
+        return DiagGaussianProbabilityDistribution(pdparam), mean, q_values
 
-    def param_shape(self):
-        return [2 * self.size]
+    def sample_placeholder(self, prepend_shape, name=None):
+        """
+        returns the TensorFlow placeholder for the sampling
 
-    def sample_shape(self):
-        return [self.size]
-
-    def sample_dtype(self):
-        return tf.float32
+        :param prepend_shape: ([int]) the prepend shape
+        :param name: (str) the placeholder name
+        :return: (TensorFlow Tensor) the placeholder
+        """
+        return tf.placeholder(
+            dtype=tf.float32,
+            shape=prepend_shape + [self.size],
+            name=name)
 
 
 class FeedForwardPolicy(object):
@@ -1161,8 +1008,6 @@ class FeedForwardPolicy(object):
         network.
     """
 
-    recurrent = False
-
     def __init__(self,
                  sess,
                  ob_space,
@@ -1181,13 +1026,8 @@ class FeedForwardPolicy(object):
         self.n_env = n_env
         self.n_steps = n_steps
         self.n_batch = n_batch
-        self._pdtype = DiagGaussianProbabilityDistributionType(
+        self.pdtype = DiagGaussianProbabilityDistributionType(
             ac_space.shape[0])
-        self._policy = None
-        self._proba_distribution = None
-        self._value_fn = None
-        self._action = None
-        self._deterministic_action = None
 
         with tf.variable_scope("input", reuse=False):
             self.obs_ph = tf.placeholder(
@@ -1205,9 +1045,9 @@ class FeedForwardPolicy(object):
             pi_latent, vf_latent = mlp_extractor(
                 tf.layers.flatten(self.obs_ph), net_arch, act_fun)
 
-            self._value_fn = linear(vf_latent, 'vf', 1)
+            self.value_fn = linear(vf_latent, 'vf', 1)
 
-            self._proba_distribution, self._policy, self.q_value = \
+            self.proba_distribution, self.policy, self.q_value = \
                 self.pdtype.proba_distribution_from_latent(
                     pi_latent, vf_latent, init_scale=0.01)
 
@@ -1222,88 +1062,16 @@ class FeedForwardPolicy(object):
             action, value, neglogp = self.sess.run(
                 [self.action, self.value_flat, self.neglogp],
                 {self.obs_ph: obs})
-        return action, value, self.initial_state, neglogp
-
-    def proba_step(self, obs, state=None, mask=None):
-        return self.sess.run(self.policy_proba, {self.obs_ph: obs})
-
-    def value(self, obs, state=None, mask=None):
-        return self.sess.run(self.value_flat, {self.obs_ph: obs})
+        return action, value, None, neglogp
 
     def _setup_init(self):
         """Sets up the distributions, actions, and value."""
         with tf.variable_scope("output", reuse=True):
             assert self.policy is not None and self.proba_distribution \
                 is not None and self.value_fn is not None
-            self._action = self.proba_distribution.sample()
-            self._deterministic_action = self.proba_distribution.mode()
-            self._neglogp = self.proba_distribution.neglogp(self.action)
-            self._policy_proba = [self.proba_distribution.mean,
-                                  self.proba_distribution.std]
-            self._value_flat = self.value_fn[:, 0]
-
-    @property
-    def pdtype(self):
-        """ProbabilityDistributionType: type of the distribution for stochastic
-        actions."""
-        return self._pdtype
-
-    @property
-    def policy(self):
-        """tf.Tensor: policy output, e.g. logits."""
-        return self._policy
-
-    @property
-    def proba_distribution(self):
-        """ProbabilityDistribution: distribution of stochastic actions."""
-        return self._proba_distribution
-
-    @property
-    def value_fn(self):
-        """tf.Tensor: value estimate, of shape (self.n_batch, 1)"""
-        return self._value_fn
-
-    @property
-    def value_flat(self):
-        """tf.Tensor: value estimate, of shape (self.n_batch, )"""
-        return self._value_flat
-
-    @property
-    def action(self):
-        """tf.Tensor: stochastic action, of shape (self.n_batch, ) +
-        self.ac_space.shape."""
-        return self._action
-
-    @property
-    def deterministic_action(self):
-        """tf.Tensor: deterministic action, of shape (self.n_batch, ) +
-        self.ac_space.shape."""
-        return self._deterministic_action
-
-    @property
-    def neglogp(self):
-        """tf.Tensor: negative log likelihood of the action sampled by
-        self.action."""
-        return self._neglogp
-
-    @property
-    def policy_proba(self):
-        """tf.Tensor: parameters of the probability distribution. Depends on
-        pdtype."""
-        return self._policy_proba
-
-    @property
-    def is_discrete(self):
-        """bool: is action space discrete."""
-        return False
-
-    @property
-    def initial_state(self):
-        """
-        The initial state of the policy. For feedforward policies, None. For a
-        recurrent policy,
-        a NumPy array of shape (self.n_env, ) + state_shape.
-        """
-        assert not self.recurrent, "When using recurrent policies, you must " \
-                                   "overwrite `initial_state()` method"
-        return None
+            self.action = self.proba_distribution.sample()
+            self.deterministic_action = self.proba_distribution.mode()
+            self.neglogp = self.proba_distribution.neglogp(self.action)
+            self.policy_proba = [self.proba_distribution.mean,
+                                 self.proba_distribution.std]
+            self.value_flat = self.value_fn[:, 0]
