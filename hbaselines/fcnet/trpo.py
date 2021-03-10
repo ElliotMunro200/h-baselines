@@ -4,7 +4,6 @@ import numpy as np
 import os
 import csv
 from collections import deque
-from mpi4py import MPI
 
 from hbaselines.utils.tf_util import make_session
 from hbaselines.utils.tf_util import get_globals_vars
@@ -15,25 +14,6 @@ from stable_baselines.common import dataset
 from stable_baselines.common import ActorCriticRLModel
 from stable_baselines.common.mpi_adam import MpiAdam
 from stable_baselines.common.runners import traj_segment_generator
-
-
-def explained_variance(y_pred, y_true):
-    """
-    Computes fraction of variance that ypred explains about y.
-    Returns 1 - Var[y-ypred] / Var[y]
-
-    interpretation:
-        ev=0  =>  might as well have predicted zero
-        ev=1  =>  perfect prediction
-        ev<0  =>  worse than just predicting zero
-
-    :param y_pred: (np.ndarray) the prediction
-    :param y_true: (np.ndarray) the expected value
-    :return: (float) explained variance of ypred and y
-    """
-    assert y_true.ndim == 1 and y_pred.ndim == 1
-    var_y = np.var(y_true)
-    return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
 
 def add_vtarg_and_adv(seg, gamma, lam):
@@ -202,14 +182,10 @@ class TRPO(ActorCriticRLModel):
         self.entcoeff = entcoeff
         self.loss_names = None
         self.assign_old_eq_new = None
-        self.compute_losses = None
-        self.compute_lossandgrad = None
         self.compute_fvp = None
-        self.compute_vflossandgrad = None
         self.vfadam = None
         self.get_flat = None
         self.set_from_flat = None
-        self.params = None
 
         self._info_keys = []
 
@@ -237,7 +213,7 @@ class TRPO(ActorCriticRLModel):
 
         # Create the model variables and operations.
         if _init_setup_model:
-            self.trainable_vars = self.setup_model()
+            self.trainable_vars = self.params = self.setup_model()
 
     def setup_model(self):
         np.set_printoptions(precision=3)
@@ -262,7 +238,7 @@ class TRPO(ActorCriticRLModel):
 
             # Network for old policy
             with tf.variable_scope("oldpi", reuse=False):
-                old_policy = self.policy(
+                self.old_policy = self.policy(
                     self.sess,
                     self.observation_space,
                     self.action_space,
@@ -275,14 +251,14 @@ class TRPO(ActorCriticRLModel):
 
             with tf.variable_scope("loss", reuse=False):
                 # Target advantage function (if applicable)
-                atarg = tf.placeholder(dtype=tf.float32, shape=[None])
+                self.atarg = tf.placeholder(dtype=tf.float32, shape=[None])
                 # Empirical return
-                ret = tf.placeholder(dtype=tf.float32, shape=[None])
+                self.ret = tf.placeholder(dtype=tf.float32, shape=[None])
 
                 observation = self.policy_tf.obs_ph
-                action = self.policy_tf.pdtype.sample_placeholder([None])
+                self.action = self.policy_tf.pdtype.sample_placeholder([None])
 
-                kloldnew = old_policy.proba_distribution.kl(
+                kloldnew = self.old_policy.proba_distribution.kl(
                     self.policy_tf.proba_distribution)
                 ent = self.policy_tf.proba_distribution.entropy()
                 meankl = tf.reduce_mean(kloldnew)
@@ -290,16 +266,16 @@ class TRPO(ActorCriticRLModel):
                 entbonus = self.entcoeff * meanent
 
                 vferr = tf.reduce_mean(
-                    tf.square(self.policy_tf.value_flat - ret))
+                    tf.square(self.policy_tf.value_flat - self.ret))
 
                 # advantage * pnew / pold
                 ratio = tf.exp(
-                    self.policy_tf.proba_distribution.logp(action) -
-                    old_policy.proba_distribution.logp(action))
-                surrgain = tf.reduce_mean(ratio * atarg)
+                    self.policy_tf.proba_distribution.logp(self.action) -
+                    self.old_policy.proba_distribution.logp(self.action))
+                surrgain = tf.reduce_mean(ratio * self.atarg)
 
                 optimgain = surrgain + entbonus
-                losses = [optimgain, meankl, entbonus, surrgain, meanent]
+                self.losses = [optimgain, meankl, entbonus, surrgain, meanent]
                 self.loss_names = ["optimgain", "meankl", "entloss",
                                    "surrgain", "entropy"]
 
@@ -334,14 +310,6 @@ class TRPO(ActorCriticRLModel):
                 # Fisher vector products
                 fvp = tf_util.flatgrad(gvp, var_list)
 
-                tf.summary.scalar('entropy_loss', meanent)
-                tf.summary.scalar('policy_gradient_loss', optimgain)
-                tf.summary.scalar('value_function_loss', surrgain)
-                tf.summary.scalar('approximate_kullback-leibler', meankl)
-                tf.summary.scalar(
-                    'loss',
-                    optimgain + meankl + entbonus + surrgain + meanent)
-
                 self.assign_old_eq_new = tf_util.function(
                     [],
                     [],
@@ -349,48 +317,23 @@ class TRPO(ActorCriticRLModel):
                              zipsame(get_globals_vars("oldpi"),
                                      get_globals_vars("model"))],
                 )
-                self.compute_losses = tf_util.function(
-                    [observation, old_policy.obs_ph, action, atarg],
-                    losses)
                 self.compute_fvp = tf_util.function(
-                    [flat_tangent, observation, old_policy.obs_ph, action,
-                     atarg], fvp)
-                self.compute_vflossandgrad = tf_util.function(
-                    [observation, old_policy.obs_ph, ret],
-                    tf_util.flatgrad(vferr, vf_var_list),
-                )
+                    [flat_tangent, observation, self.old_policy.obs_ph,
+                     self.action, self.atarg], fvp)
+                self.vf_grad = tf_util.flatgrad(vferr, vf_var_list)
 
                 tf_util.initialize(sess=self.sess)
 
                 th_init = self.get_flat()
-                MPI.COMM_WORLD.Bcast(th_init, root=0)
                 self.set_from_flat(th_init)
 
             with tf.variable_scope("Adam_mpi", reuse=False):
                 self.vfadam = MpiAdam(vf_var_list, sess=self.sess)
                 self.vfadam.sync()
 
-            with tf.variable_scope("input_info", reuse=False):
-                tf.summary.scalar(
-                    'discounted_rewards', tf.reduce_mean(ret))
-                tf.summary.scalar(
-                    'learning_rate', tf.reduce_mean(self.vf_stepsize))
-                tf.summary.scalar(
-                    'advantage', tf.reduce_mean(atarg))
-                tf.summary.scalar(
-                    'kl_clip_range', tf.reduce_mean(self.max_kl))
+            self.grad = tf_util.flatgrad(optimgain, var_list)
 
-            self.params = get_trainable_vars("model") + \
-                get_trainable_vars("oldpi")
-
-            self.summary = tf.summary.merge_all()
-
-            self.compute_lossandgrad = tf_util.function(
-                [observation, old_policy.obs_ph, action, atarg, ret],
-                [self.summary, tf_util.flatgrad(optimgain, var_list)]
-                + losses)
-
-        return None
+        return get_trainable_vars("model") + get_trainable_vars("oldpi")
 
     def learn(self,
               total_timesteps,
@@ -469,17 +412,17 @@ class TRPO(ActorCriticRLModel):
 
         self.assign_old_eq_new(sess=self.sess)
 
-        run_options = tf.RunOptions(
-            trace_level=tf.RunOptions.FULL_TRACE)
-        run_metadata = None
-        # run loss backprop with summary, and save the metadata
-        # (memory, compute time, ...)
-        _, grad, *lossbefore = self.compute_lossandgrad(
-            *args,
-            tdlamret,
-            sess=self.sess,
-            options=run_options,
-            run_metadata=run_metadata,
+        # run loss backprop with summary, and save the metadata (memory,
+        # compute time, ...)
+        grad, *lossbefore = self.sess.run(
+            [self.grad] + self.losses,
+            feed_dict={
+                self.policy_tf.obs_ph: seg["observations"],
+                self.old_policy.obs_ph: seg["observations"],
+                self.action: seg["actions"],
+                self.atarg: atarg,
+                self.ret: tdlamret,
+            }
         )
 
         lossbefore = np.array(lossbefore)
@@ -504,8 +447,15 @@ class TRPO(ActorCriticRLModel):
             for _ in range(10):
                 thnew = thbefore + fullstep * stepsize
                 self.set_from_flat(thnew)
-                mean_losses = surr, kl_loss, *_ = np.array(
-                    self.compute_losses(*args, sess=self.sess))
+                mean_losses = surr, kl_loss, *_ = self.sess.run(
+                    self.losses,
+                    feed_dict={
+                        self.policy_tf.obs_ph: seg["observations"],
+                        self.old_policy.obs_ph: seg["observations"],
+                        self.action: seg["actions"],
+                        self.atarg: atarg,
+                    }
+                )
                 improve = surr - surrbefore
                 print("Expected: %.3f Actual: %.3f" % (
                     expectedimprove, improve))
@@ -530,8 +480,15 @@ class TRPO(ActorCriticRLModel):
                     include_final_partial_batch=False,
                     batch_size=128,
                     shuffle=True):
-                grad = self.compute_vflossandgrad(
-                    mbob, mbob, mbret, sess=self.sess)
+                grad = self.sess.run(
+                    self.vf_grad,
+                    feed_dict={
+                        self.policy_tf.obs_ph: mbob,
+                        self.old_policy.obs_ph: mbob,
+                        self.action: seg["actions"],
+                        self.ret: mbret,
+                    }
+                )
                 self.vfadam.update(grad, self.vf_stepsize)
 
         return mean_losses, vpredbefore, tdlamret
@@ -594,3 +551,710 @@ class TRPO(ActorCriticRLModel):
 
     def save(self, save_path, cloudpickle=False):
         pass
+
+
+# =========================================================================== #
+#                                    Policy                                   #
+# =========================================================================== #
+
+"""TRPO-compatible feedforward policy."""
+import numpy as np
+import tensorflow as tf
+
+from hbaselines.base_policies import Policy
+from hbaselines.utils.tf_util import create_fcnet
+from hbaselines.utils.tf_util import create_conv
+from hbaselines.utils.tf_util import get_trainable_vars
+from hbaselines.utils.tf_util import explained_variance
+from hbaselines.utils.tf_util import print_params_shape
+from hbaselines.utils.tf_util import process_minibatch
+
+
+class FeedForwardPolicy(Policy):
+    """Feed-forward neural network policy.
+
+    Attributes
+    ----------
+    learning_rate : float
+        the learning rate
+    n_minibatches : int
+        number of training minibatches per update
+    n_opt_epochs : int
+        number of training epochs per update procedure
+    gamma : float
+        the discount factor
+    lam : float
+        factor for trade-off of bias vs variance for Generalized Advantage
+        Estimator
+    ent_coef : float
+        entropy coefficient for the loss calculation
+    vf_coef : float
+        value function coefficient for the loss calculation
+    max_grad_norm : float
+        the maximum value for the gradient clipping
+    cliprange : float or callable
+        clipping parameter, it can be a function
+    cliprange_vf : float or callable
+        clipping parameter for the value function, it can be a function. This
+        is a parameter specific to the OpenAI implementation. If None is passed
+        (default), then `cliprange` (that is used for the policy) will be used.
+        IMPORTANT: this clipping depends on the reward scaling. To deactivate
+        value function clipping (and recover the original PPO implementation),
+        you have to pass a negative value (e.g. -1).
+    num_envs : int
+        number of environments used to run simulations in parallel.
+    mb_rewards : array_like
+        a minibatch of environment rewards
+    mb_obs : array_like
+        a minibatch of observations
+    mb_contexts : array_like
+        a minibatch of contextual terms
+    mb_actions : array_like
+        a minibatch of actions
+    mb_values : array_like
+        a minibatch of estimated values by the policy
+    mb_neglogpacs : array_like
+        a minibatch of the negative log-likelihood of performed actions
+    mb_dones : array_like
+        a minibatch of done masks
+    mb_all_obs : array_like
+        a minibatch of full-state observations
+    mb_returns : array_like
+        a minibatch of expected discounted returns
+    last_obs : array_like
+        the most recent observation from each environment. Used to compute the
+        GAE terms.
+    mb_advs : array_like
+        a minibatch of estimated advantages
+    rew_ph : tf.compat.v1.placeholder
+        placeholder for the rewards / discounted returns
+    action_ph : tf.compat.v1.placeholder
+        placeholder for the actions
+    obs_ph : tf.compat.v1.placeholder
+        placeholder for the observations
+    advs_ph : tf.compat.v1.placeholder
+        placeholder for the advantages
+    old_neglog_pac_ph : tf.compat.v1.placeholder
+        placeholder for the negative-log probability of the actions that were
+        performed
+    old_vpred_ph : tf.compat.v1.placeholder
+        placeholder for the current predictions of the values of given states
+    phase_ph : tf.compat.v1.placeholder
+        a placeholder that defines whether training is occurring for the batch
+        normalization layer. Set to True in training and False in testing.
+    rate_ph : tf.compat.v1.placeholder
+        the probability that each element is dropped if dropout is implemented
+    action : tf.Variable
+        the output from the policy/actor
+    pi_mean : tf.Variable
+        the output from the policy's mean term
+    pi_logstd : tf.Variable
+        the output from the policy's log-std term
+    pi_std : tf.Variable
+        the expnonential of the pi_logstd term
+    neglogp : tf.Variable
+        a differentiable form of the negative log-probability of actions by the
+        current policy
+    value_fn : tf.Variable
+        the output from the value function
+    value_flat : tf.Variable
+        a one-dimensional (vector) version of value_fn
+    entropy : tf.Variable
+        computes the entropy of actions performed by the policy
+    vf_loss : tf.Variable
+        the output from the computed value function loss of a batch of data
+    pg_loss : tf.Variable
+        the output from the computed policy gradient loss of a batch of data
+    approxkl : tf.Variable
+        computes the KL-divergence between two models
+    loss : tf.Variable
+        the output from the computed loss of a batch of data
+    optimizer : tf.Operation
+        the operation that updates the trainable parameters of the actor
+    """
+
+    def __init__(self,
+                 sess,
+                 ob_space,
+                 ac_space,
+                 co_space,
+                 verbose,
+                 learning_rate,
+                 model_params,
+                 n_minibatches,
+                 n_opt_epochs,
+                 gamma,
+                 lam,
+                 ent_coef,
+                 vf_coef,
+                 max_grad_norm,
+                 cliprange,
+                 cliprange_vf,
+                 l2_penalty,
+                 scope=None,
+                 num_envs=1):
+        """Instantiate the policy object.
+
+        Parameters
+        ----------
+        sess : tf.compat.v1.Session
+            the current TensorFlow session
+        ob_space : gym.spaces.*
+            the observation space of the environment
+        ac_space : gym.spaces.*
+            the action space of the environment
+        co_space : gym.spaces.*
+            the context space of the environment
+        verbose : int
+            the verbosity level: 0 none, 1 training information, 2 tensorflow
+            debug
+        l2_penalty : float
+            L2 regularization penalty. This is applied to the policy network.
+        model_params : dict
+            dictionary of model-specific parameters. See parent class.
+        learning_rate : float
+            the learning rate
+        n_minibatches : int
+            number of training minibatches per update
+        n_opt_epochs : int
+            number of training epochs per update procedure
+        gamma : float
+            the discount factor
+        lam : float
+            factor for trade-off of bias vs variance for Generalized Advantage
+            Estimator
+        ent_coef : float
+            entropy coefficient for the loss calculation
+        vf_coef : float
+            value function coefficient for the loss calculation
+        max_grad_norm : float
+            the maximum value for the gradient clipping
+        cliprange : float or callable
+            clipping parameter, it can be a function
+        cliprange_vf : float or callable
+            clipping parameter for the value function, it can be a function.
+            This is a parameter specific to the OpenAI implementation. If None
+            is passed (default), then `cliprange` (that is used for the policy)
+            will be used. IMPORTANT: this clipping depends on the reward
+            scaling. To deactivate value function clipping (and recover the
+            original PPO implementation), you have to pass a negative value
+            (e.g. -1).
+        """
+        super(FeedForwardPolicy, self).__init__(
+            sess=sess,
+            ob_space=ob_space,
+            ac_space=ac_space,
+            co_space=co_space,
+            verbose=verbose,
+            l2_penalty=l2_penalty,
+            model_params=model_params,
+            num_envs=num_envs,
+        )
+
+        self.learning_rate = learning_rate
+        self.n_minibatches = n_minibatches
+        self.n_opt_epochs = n_opt_epochs
+        self.gamma = gamma
+        self.lam = lam
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.max_grad_norm = max_grad_norm
+        self.cliprange = cliprange
+        self.cliprange_vf = cliprange_vf
+
+        # Create variables to store on-policy data.
+        self.mb_rewards = [[] for _ in range(num_envs)]
+        self.mb_obs = [[] for _ in range(num_envs)]
+        self.mb_contexts = [[] for _ in range(num_envs)]
+        self.mb_actions = [[] for _ in range(num_envs)]
+        self.mb_values = [[] for _ in range(num_envs)]
+        self.mb_neglogpacs = [[] for _ in range(num_envs)]
+        self.mb_dones = [[] for _ in range(num_envs)]
+        self.mb_all_obs = [[] for _ in range(num_envs)]
+        self.mb_returns = [[] for _ in range(num_envs)]
+        self.last_obs = [None for _ in range(num_envs)]
+        self.mb_advs = None
+
+        # Compute the shape of the input observation space, which may include
+        # the contextual term.
+        ob_dim = self._get_ob_dim(ob_space, co_space)
+
+        # =================================================================== #
+        # Step 1: Create input variables.                                     #
+        # =================================================================== #
+
+        with tf.compat.v1.variable_scope("input", reuse=False):
+            self.rew_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name='rewards')
+            self.action_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,) + ac_space.shape,
+                name='actions')
+            self.obs_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,) + ob_dim,
+                name='obs0')
+            self.advs_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name="advs_ph")
+            self.old_neglog_pac_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name="old_neglog_pac_ph")
+            self.old_vpred_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name="old_vpred_ph")
+            self.phase_ph = tf.compat.v1.placeholder(
+                tf.bool,
+                name='phase')
+            self.rate_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                name='rate')
+
+        # =================================================================== #
+        # Step 2: Create actor and critic variables.                          #
+        # =================================================================== #
+
+        # Create networks and core TF parts that are shared across setup parts.
+        with tf.variable_scope("model", reuse=False):
+            # Create the policy.
+            self.action, self.pi_mean, self.pi_logstd = self.make_actor(
+                self.obs_ph, scope="pi")
+            self.pi_std = tf.exp(self.pi_logstd)
+
+            # Create a method the log-probability of current actions.
+            self.neglogp = self._neglogp(self.action)
+
+            # Create the value function.
+            self.value_fn = self.make_critic(self.obs_ph, scope="vf")
+            self.value_flat = self.value_fn[:, 0]
+
+        # =================================================================== #
+        # Step 4: Setup the optimizers for the actor and critic.              #
+        # =================================================================== #
+
+        self.entropy = None
+        self.vf_loss = None
+        self.pg_loss = None
+        self.approxkl = None
+        self.loss = None
+        self.optimizer = None
+
+        with tf.compat.v1.variable_scope("Optimizer", reuse=False):
+            self._setup_optimizers(scope)
+
+        # =================================================================== #
+        # Step 5: Setup the operations for computing model statistics.        #
+        # =================================================================== #
+
+        self._setup_stats(scope or "Model")
+
+    def make_actor(self, obs, reuse=False, scope="pi"):
+        """Create an actor tensor.
+
+        Parameters
+        ----------
+        obs : tf.compat.v1.placeholder
+            the input observation placeholder
+        reuse : bool
+            whether or not to reuse parameters
+        scope : str
+            the scope name of the actor
+
+        Returns
+        -------
+        tf.Variable
+            the output from the actor
+        """
+        # Initial image pre-processing (for convolutional policies).
+        if self.model_params["model_type"] == "conv":
+            pi_h = create_conv(
+                obs=obs,
+                image_height=self.model_params["image_height"],
+                image_width=self.model_params["image_width"],
+                image_channels=self.model_params["image_channels"],
+                ignore_flat_channels=self.model_params["ignore_flat_channels"],
+                ignore_image=self.model_params["ignore_image"],
+                filters=self.model_params["filters"],
+                kernel_sizes=self.model_params["kernel_sizes"],
+                strides=self.model_params["strides"],
+                act_fun=self.model_params["act_fun"],
+                layer_norm=self.model_params["layer_norm"],
+                batch_norm=self.model_params["batch_norm"],
+                phase=self.phase_ph,
+                dropout=self.model_params["dropout"],
+                rate=self.rate_ph,
+                scope=scope,
+                reuse=reuse,
+            )
+        else:
+            pi_h = obs
+
+        # Create the output mean.
+        policy_mean = create_fcnet(
+            obs=pi_h,
+            layers=self.model_params["layers"],
+            num_output=self.ac_space.shape[0],
+            stochastic=False,
+            act_fun=self.model_params["act_fun"],
+            layer_norm=self.model_params["layer_norm"],
+            batch_norm=self.model_params["batch_norm"],
+            phase=self.phase_ph,
+            dropout=self.model_params["dropout"],
+            rate=self.rate_ph,
+            scope=scope,
+            reuse=reuse,
+        )
+
+        # Create the output log_std.
+        log_std = tf.get_variable(
+            name='logstd',
+            shape=[1, self.ac_space.shape[0]],
+            initializer=tf.zeros_initializer()
+        )
+
+        # Create a method to sample from the distribution.
+        std = tf.exp(log_std)
+        action = policy_mean + std * tf.random_normal(
+            shape=tf.shape(policy_mean),
+            dtype=tf.float32
+        )
+
+        return action, policy_mean, log_std
+
+    def make_critic(self, obs, reuse=False, scope="qf"):
+        """Create a critic tensor.
+
+        Parameters
+        ----------
+        obs : tf.compat.v1.placeholder
+            the input observation placeholder
+        reuse : bool
+            whether or not to reuse parameters
+        scope : str
+            the scope name of the actor
+
+        Returns
+        -------
+        tf.Variable
+            the output from the critic
+        """
+        # Initial image pre-processing (for convolutional policies).
+        if self.model_params["model_type"] == "conv":
+            vf_h = create_conv(
+                obs=obs,
+                image_height=self.model_params["image_height"],
+                image_width=self.model_params["image_width"],
+                image_channels=self.model_params["image_channels"],
+                ignore_flat_channels=self.model_params["ignore_flat_channels"],
+                ignore_image=self.model_params["ignore_image"],
+                filters=self.model_params["filters"],
+                kernel_sizes=self.model_params["kernel_sizes"],
+                strides=self.model_params["strides"],
+                act_fun=self.model_params["act_fun"],
+                layer_norm=self.model_params["layer_norm"],
+                batch_norm=self.model_params["batch_norm"],
+                phase=self.phase_ph,
+                dropout=self.model_params["dropout"],
+                rate=self.rate_ph,
+                scope=scope,
+                reuse=reuse,
+            )
+        else:
+            vf_h = obs
+
+        return create_fcnet(
+            obs=vf_h,
+            layers=self.model_params["layers"],
+            num_output=1,
+            stochastic=False,
+            act_fun=self.model_params["act_fun"],
+            layer_norm=self.model_params["layer_norm"],
+            batch_norm=self.model_params["batch_norm"],
+            phase=self.phase_ph,
+            dropout=self.model_params["dropout"],
+            rate=self.rate_ph,
+            scope=scope,
+            reuse=reuse,
+        )
+
+    def _neglogp(self, x):
+        """Compute the negative log-probability of an input action (x)."""
+        return 0.5 * tf.reduce_sum(
+            tf.square((x - self.pi_mean) / self.pi_std), axis=-1) \
+            + 0.5 * np.log(2.0 * np.pi) \
+            * tf.cast(tf.shape(x)[-1], tf.float32) \
+            + tf.reduce_sum(self.pi_logstd, axis=-1)
+
+    def _setup_optimizers(self, scope):
+        """Create the actor and critic optimizers."""
+        pass  # TODO
+
+    def _setup_stats(self, base):
+        """Create the running means and std of the model inputs and outputs.
+
+        This method also adds the same running means and stds as scalars to
+        tensorboard for additional storage.
+        """
+        ops = {
+            'reference_action_mean': tf.reduce_mean(self.pi_mean),
+            'reference_action_std': tf.reduce_mean(self.pi_logstd),
+            'rewards': tf.reduce_mean(self.rew_ph),
+            'advantage': tf.reduce_mean(self.advs_ph),
+            'old_neglog_action_probability': tf.reduce_mean(
+                self.old_neglog_pac_ph),
+            'old_value_pred': tf.reduce_mean(self.old_vpred_ph),
+            'entropy_loss': self.entropy,
+            'policy_gradient_loss': self.pg_loss,
+            'value_function_loss': self.vf_loss,
+            'approximate_kullback-leibler': self.approxkl,
+            'clip_factor': self.clipfrac,
+            'loss': self.loss,
+            'explained_variance': explained_variance(
+                self.old_vpred_ph, self.rew_ph)
+        }
+
+        tf.summary.scalar(
+            'discounted_rewards', tf.reduce_mean(ret))
+        tf.summary.scalar(
+            'learning_rate', tf.reduce_mean(self.vf_stepsize))
+        tf.summary.scalar(
+            'advantage', tf.reduce_mean(atarg))
+        tf.summary.scalar(
+            'kl_clip_range', tf.reduce_mean(self.max_kl))
+
+        tf.summary.scalar('entropy_loss', meanent)
+        tf.summary.scalar('policy_gradient_loss', optimgain)
+        tf.summary.scalar('value_function_loss', surrgain)
+        tf.summary.scalar('approximate_kullback-leibler', meankl)
+        tf.summary.scalar(
+            'loss',
+            optimgain + meankl + entbonus + surrgain + meanent)
+
+        # Add all names and ops to the tensorboard summary.
+        for key in ops.keys():
+            name = "{}/{}".format(base, key)
+            op = ops[key]
+            tf.compat.v1.summary.scalar(name, op)
+
+    def initialize(self):
+        """See parent class."""
+        pass
+
+    def get_action(self, obs, context, apply_noise, random_actions, env_num=0):
+        """See parent class."""
+        # Add the contextual observation, if applicable.
+        obs = self._get_obs(obs, context, axis=1)
+
+        action, values, neglogpacs = self.sess.run(
+            [self.action if apply_noise else self.pi_mean,
+             self.value_flat, self.neglogp],
+            feed_dict={
+                self.obs_ph: obs,
+                self.phase_ph: 0,
+                self.rate_ph: 0.0,
+            }
+        )
+
+        # Store information on the values and negative-log likelihood.
+        self.mb_values[env_num].append(values)
+        self.mb_neglogpacs[env_num].append(neglogpacs)
+
+        return action
+
+    def store_transition(self, obs0, context0, action, reward, obs1, context1,
+                         done, is_final_step, env_num=0, evaluate=False):
+        """Store a transition in the replay buffer.
+
+        Parameters
+        ----------
+        obs0 : array_like
+            the last observation
+        context0 : array_like or None
+            the last contextual term. Set to None if no context is provided by
+            the environment.
+        action : array_like
+            the action
+        reward : float
+            the reward
+        obs1 : array_like
+            the current observation
+        context1 : array_like or None
+            the current contextual term. Set to None if no context is provided
+            by the environment.
+        done : float
+            is the episode done
+        is_final_step : bool
+            whether the time horizon was met in the step corresponding to the
+            current sample. This is used by the TD3 algorithm to augment the
+            done mask.
+        env_num : int
+            the environment number. Used to handle situations when multiple
+            parallel environments are being used.
+        evaluate : bool
+            whether the sample is being provided by the evaluation environment.
+            If so, the data is not stored in the replay buffer.
+        """
+        # Update the minibatch of samples.
+        self.mb_rewards[env_num].append(reward)
+        self.mb_obs[env_num].append(obs0.reshape(1, -1))
+        self.mb_contexts[env_num].append(context0)
+        self.mb_actions[env_num].append(action.reshape(1, -1))
+        self.mb_dones[env_num].append(done)
+
+        # Update the last observation (to compute the last value for the GAE
+        # expected returns).
+        self.last_obs[env_num] = self._get_obs([obs1], context1)
+
+    def update(self, **kwargs):
+        """See parent class."""
+        # Compute the last estimated value.
+        last_values = [
+            self.sess.run(
+                self.value_flat,
+                feed_dict={
+                    self.obs_ph: self.last_obs[env_num],
+                    self.phase_ph: 0,
+                    self.rate_ph: 0.0,
+                })
+            for env_num in range(self.num_envs)
+        ]
+
+        (self.mb_obs,
+         self.mb_contexts,
+         self.mb_actions,
+         self.mb_values,
+         self.mb_neglogpacs,
+         self.mb_all_obs,
+         self.mb_rewards,
+         self.mb_returns,
+         self.mb_dones,
+         self.mb_advs, n_steps) = process_minibatch(
+            mb_obs=self.mb_obs,
+            mb_contexts=self.mb_contexts,
+            mb_actions=self.mb_actions,
+            mb_values=self.mb_values,
+            mb_neglogpacs=self.mb_neglogpacs,
+            mb_all_obs=self.mb_all_obs,
+            mb_rewards=self.mb_rewards,
+            mb_returns=self.mb_returns,
+            mb_dones=self.mb_dones,
+            last_values=last_values,
+            gamma=self.gamma,
+            lam=self.lam,
+            num_envs=self.num_envs,
+        )
+
+        # Run the optimization procedure.
+        batch_size = n_steps // self.n_minibatches
+
+        inds = np.arange(n_steps)
+        for _ in range(self.n_opt_epochs):
+            np.random.shuffle(inds)
+            for start in range(0, n_steps, batch_size):
+                end = start + batch_size
+                mbinds = inds[start:end]
+                self.update_from_batch(
+                    obs=self.mb_obs[mbinds],
+                    context=None if self.mb_contexts[0] is None
+                    else self.mb_contexts[mbinds],
+                    returns=self.mb_returns[mbinds],
+                    actions=self.mb_actions[mbinds],
+                    values=self.mb_values[mbinds],
+                    advs=self.mb_advs[mbinds],
+                    neglogpacs=self.mb_neglogpacs[mbinds],
+                )
+
+    def update_from_batch(self,
+                          obs,
+                          context,
+                          returns,
+                          actions,
+                          values,
+                          advs,
+                          neglogpacs):
+        """Perform gradient update step given a batch of data.
+
+        Parameters
+        ----------
+        obs : array_like
+            a minibatch of observations
+        context : array_like
+            a minibatch of contextual terms
+        returns : array_like
+            a minibatch of contextual expected discounted returns
+        actions : array_like
+            a minibatch of actions
+        values : array_like
+            a minibatch of estimated values by the policy
+        advs : array_like
+            a minibatch of estimated advantages
+        neglogpacs : array_like
+            a minibatch of the negative log-likelihood of performed actions
+        """
+        # Add the contextual observation, if applicable.
+        obs = self._get_obs(obs, context, axis=1)
+
+        return self.sess.run(self.optimizer, {
+            self.obs_ph: obs,
+            self.action_ph: actions,
+            self.advs_ph: advs,
+            self.rew_ph: returns,
+            self.old_neglog_pac_ph: neglogpacs,
+            self.old_vpred_ph: values,
+            self.phase_ph: 1,
+            self.rate_ph: 0.5,
+        })
+
+    def get_td_map(self):
+        """See parent class."""
+        # Add the contextual observation, if applicable.
+        context = None if self.mb_contexts[0] is None else self.mb_contexts
+        obs = self._get_obs(self.mb_obs, context, axis=1)
+
+        td_map = self.get_td_map_from_batch(
+            obs=obs.copy(),
+            mb_actions=self.mb_actions,
+            mb_advs=self.mb_advs,
+            mb_returns=self.mb_returns,
+            mb_neglogpacs=self.mb_neglogpacs,
+            mb_values=self.mb_values,
+        )
+
+        # Clear memory
+        self.mb_rewards = [[] for _ in range(self.num_envs)]
+        self.mb_obs = [[] for _ in range(self.num_envs)]
+        self.mb_contexts = [[] for _ in range(self.num_envs)]
+        self.mb_actions = [[] for _ in range(self.num_envs)]
+        self.mb_values = [[] for _ in range(self.num_envs)]
+        self.mb_neglogpacs = [[] for _ in range(self.num_envs)]
+        self.mb_dones = [[] for _ in range(self.num_envs)]
+        self.mb_all_obs = [[] for _ in range(self.num_envs)]
+        self.mb_returns = [[] for _ in range(self.num_envs)]
+        self.last_obs = [None for _ in range(self.num_envs)]
+        self.mb_advs = None
+
+        return td_map
+
+    def get_td_map_from_batch(self,
+                              obs,
+                              mb_actions,
+                              mb_advs,
+                              mb_returns,
+                              mb_neglogpacs,
+                              mb_values):
+        """Convert a batch to a td_map."""
+        return {
+            self.obs_ph: obs,
+            self.action_ph: mb_actions,
+            self.advs_ph: mb_advs,
+            self.rew_ph: mb_returns,
+            self.old_neglog_pac_ph: mb_neglogpacs,
+            self.old_vpred_ph: mb_values,
+            self.phase_ph: 0,
+            self.rate_ph: 0.0,
+        }
