@@ -6,13 +6,49 @@ from collections import deque
 from mpi4py import MPI
 
 import stable_baselines.common.tf_util as tf_util
-from stable_baselines.common.tf_util import total_episode_reward_logger
-from stable_baselines.common import explained_variance, zipsame, dataset, \
-    colorize, ActorCriticRLModel, SetVerbosity, TensorboardWriter
+from stable_baselines.common import explained_variance
+from stable_baselines.common import zipsame
+from stable_baselines.common import dataset
+from stable_baselines.common import ActorCriticRLModel
+from stable_baselines.common import TensorboardWriter
 from stable_baselines import logger
 from stable_baselines.common.mpi_adam import MpiAdam
 from stable_baselines.common.runners import traj_segment_generator
 from stable_baselines.trpo_mpi.utils import add_vtarg_and_adv
+
+
+COLOR_TO_NUM = dict(
+    gray=30,
+    red=31,
+    green=32,
+    yellow=33,
+    blue=34,
+    magenta=35,
+    cyan=36,
+    white=37,
+    crimson=38
+)
+
+
+def colorize(string, color, bold=False, highlight=False):
+    """
+    Colorize, bold and/or highlight a string for terminal print
+
+    :param string: (str) input string
+    :param color: (str) the color, the lookup table is the dict at
+        console_util.color2num
+    :param bold: (bool) if the string should be bold or not
+    :param highlight: (bool) if the string should be highlighted or not
+    :return: (str) the stylized output string
+    """
+    attr = []
+    num = COLOR_TO_NUM[color]
+    if highlight:
+        num += 10
+    attr.append(str(num))
+    if bold:
+        attr.append('1')
+    return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
 
 
 def flatten_lists(listoflists):
@@ -190,17 +226,29 @@ class TRPO(ActorCriticRLModel):
             self.setup_model()
 
     def setup_model(self):
-        with SetVerbosity(self.verbose):
-            np.set_printoptions(precision=3)
+        np.set_printoptions(precision=3)
 
-            self.graph = tf.Graph()
-            with self.graph.as_default():
-                self.set_random_seed(self.seed)
-                self.sess = tf_util.make_session(
-                    num_cpu=self.n_cpu_tf_sess, graph=self.graph)
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            self.set_random_seed(self.seed)
+            self.sess = tf_util.make_session(
+                num_cpu=self.n_cpu_tf_sess, graph=self.graph)
 
-                # Construct network for new policy
-                self.policy_pi = self.policy(
+            # Construct network for new policy
+            self.policy_pi = self.policy(
+                self.sess,
+                self.observation_space,
+                self.action_space,
+                self.n_envs,
+                1,
+                None,
+                reuse=False,
+                **self.policy_kwargs,
+            )
+
+            # Network for old policy
+            with tf.variable_scope("oldpi", reuse=False):
+                old_policy = self.policy(
                     self.sess,
                     self.observation_space,
                     self.action_space,
@@ -211,166 +259,153 @@ class TRPO(ActorCriticRLModel):
                     **self.policy_kwargs,
                 )
 
-                # Network for old policy
-                with tf.variable_scope("oldpi", reuse=False):
-                    old_policy = self.policy(
-                        self.sess,
-                        self.observation_space,
-                        self.action_space,
-                        self.n_envs,
-                        1,
-                        None,
-                        reuse=False,
-                        **self.policy_kwargs,
-                    )
+            with tf.variable_scope("loss", reuse=False):
+                # Target advantage function (if applicable)
+                atarg = tf.placeholder(dtype=tf.float32, shape=[None])
+                # Empirical return
+                ret = tf.placeholder(dtype=tf.float32, shape=[None])
 
-                with tf.variable_scope("loss", reuse=False):
-                    # Target advantage function (if applicable)
-                    atarg = tf.placeholder(dtype=tf.float32, shape=[None])
-                    # Empirical return
-                    ret = tf.placeholder(dtype=tf.float32, shape=[None])
+                observation = self.policy_pi.obs_ph
+                action = self.policy_pi.pdtype.sample_placeholder([None])
 
-                    observation = self.policy_pi.obs_ph
-                    action = self.policy_pi.pdtype.sample_placeholder([None])
+                kloldnew = old_policy.proba_distribution.kl(
+                    self.policy_pi.proba_distribution)
+                ent = self.policy_pi.proba_distribution.entropy()
+                meankl = tf.reduce_mean(kloldnew)
+                meanent = tf.reduce_mean(ent)
+                entbonus = self.entcoeff * meanent
 
-                    kloldnew = old_policy.proba_distribution.kl(
-                        self.policy_pi.proba_distribution)
-                    ent = self.policy_pi.proba_distribution.entropy()
-                    meankl = tf.reduce_mean(kloldnew)
-                    meanent = tf.reduce_mean(ent)
-                    entbonus = self.entcoeff * meanent
+                vferr = tf.reduce_mean(
+                    tf.square(self.policy_pi.value_flat - ret))
 
-                    vferr = tf.reduce_mean(
-                        tf.square(self.policy_pi.value_flat - ret))
+                # advantage * pnew / pold
+                ratio = tf.exp(
+                    self.policy_pi.proba_distribution.logp(action) -
+                    old_policy.proba_distribution.logp(action))
+                surrgain = tf.reduce_mean(ratio * atarg)
 
-                    # advantage * pnew / pold
-                    ratio = tf.exp(
-                        self.policy_pi.proba_distribution.logp(action) -
-                        old_policy.proba_distribution.logp(action))
-                    surrgain = tf.reduce_mean(ratio * atarg)
+                optimgain = surrgain + entbonus
+                losses = [optimgain, meankl, entbonus, surrgain, meanent]
+                self.loss_names = [
+                    "optimgain",
+                    "meankl",
+                    "entloss",
+                    "surrgain",
+                    "entropy",
+                ]
 
-                    optimgain = surrgain + entbonus
-                    losses = [optimgain, meankl, entbonus, surrgain, meanent]
-                    self.loss_names = [
-                        "optimgain",
-                        "meankl",
-                        "entloss",
-                        "surrgain",
-                        "entropy",
-                    ]
+                dist = meankl
 
-                    dist = meankl
+                all_var_list = tf_util.get_trainable_vars("model")
+                var_list = [
+                    v for v in all_var_list
+                    if "/vf" not in v.name and "/q/" not in v.name]
+                vf_var_list = [
+                    v for v in all_var_list
+                    if "/pi" not in v.name and "/logstd" not in v.name]
 
-                    all_var_list = tf_util.get_trainable_vars("model")
-                    var_list = [
-                        v for v in all_var_list
-                        if "/vf" not in v.name and "/q/" not in v.name]
-                    vf_var_list = [
-                        v for v in all_var_list
-                        if "/pi" not in v.name and "/logstd" not in v.name]
+                self.get_flat = tf_util.GetFlat(var_list, sess=self.sess)
+                self.set_from_flat = tf_util.SetFromFlat(
+                    var_list, sess=self.sess)
 
-                    self.get_flat = tf_util.GetFlat(var_list, sess=self.sess)
-                    self.set_from_flat = tf_util.SetFromFlat(
-                        var_list, sess=self.sess)
+                klgrads = tf.gradients(dist, var_list)
+                flat_tangent = tf.placeholder(
+                    dtype=tf.float32,
+                    shape=[None],
+                    name="flat_tan")
+                shapes = [var.get_shape().as_list() for var in var_list]
+                start = 0
+                tangents = []
+                for shape in shapes:
+                    var_size = tf_util.intprod(shape)
+                    tangents.append(tf.reshape(
+                        flat_tangent[start: start + var_size], shape))
+                    start += var_size
+                gvp = tf.add_n(
+                    [tf.reduce_sum(grad * tangent)
+                     for (grad, tangent) in zipsame(klgrads, tangents)])
+                # Fisher vector products
+                fvp = tf_util.flatgrad(gvp, var_list)
 
-                    klgrads = tf.gradients(dist, var_list)
-                    flat_tangent = tf.placeholder(
-                        dtype=tf.float32,
-                        shape=[None],
-                        name="flat_tan")
-                    shapes = [var.get_shape().as_list() for var in var_list]
-                    start = 0
-                    tangents = []
-                    for shape in shapes:
-                        var_size = tf_util.intprod(shape)
-                        tangents.append(tf.reshape(
-                            flat_tangent[start: start + var_size], shape))
-                        start += var_size
-                    gvp = tf.add_n(
-                        [tf.reduce_sum(grad * tangent)
-                         for (grad, tangent) in zipsame(klgrads, tangents)])
-                    # Fisher vector products
-                    fvp = tf_util.flatgrad(gvp, var_list)
+                tf.summary.scalar('entropy_loss', meanent)
+                tf.summary.scalar('policy_gradient_loss', optimgain)
+                tf.summary.scalar('value_function_loss', surrgain)
+                tf.summary.scalar('approximate_kullback-leibler', meankl)
+                tf.summary.scalar(
+                    'loss',
+                    optimgain + meankl + entbonus + surrgain + meanent)
 
-                    tf.summary.scalar('entropy_loss', meanent)
-                    tf.summary.scalar('policy_gradient_loss', optimgain)
-                    tf.summary.scalar('value_function_loss', surrgain)
-                    tf.summary.scalar('approximate_kullback-leibler', meankl)
-                    tf.summary.scalar(
-                        'loss',
-                        optimgain + meankl + entbonus + surrgain + meanent)
+                self.assign_old_eq_new = tf_util.function(
+                    [],
+                    [],
+                    updates=[tf.assign(oldv, newv) for (oldv, newv) in
+                             zipsame(tf_util.get_globals_vars("oldpi"),
+                                     tf_util.get_globals_vars("model"))],
+                )
+                self.compute_losses = tf_util.function(
+                    [observation, old_policy.obs_ph, action, atarg],
+                    losses)
+                self.compute_fvp = tf_util.function(
+                    [flat_tangent, observation, old_policy.obs_ph, action,
+                     atarg], fvp)
+                self.compute_vflossandgrad = tf_util.function(
+                    [observation, old_policy.obs_ph, ret],
+                    tf_util.flatgrad(vferr, vf_var_list),
+                )
 
-                    self.assign_old_eq_new = tf_util.function(
-                        [],
-                        [],
-                        updates=[tf.assign(oldv, newv) for (oldv, newv) in
-                                 zipsame(tf_util.get_globals_vars("oldpi"),
-                                         tf_util.get_globals_vars("model"))],
-                    )
-                    self.compute_losses = tf_util.function(
-                        [observation, old_policy.obs_ph, action, atarg],
-                        losses)
-                    self.compute_fvp = tf_util.function(
-                        [flat_tangent, observation, old_policy.obs_ph, action,
-                         atarg], fvp)
-                    self.compute_vflossandgrad = tf_util.function(
-                        [observation, old_policy.obs_ph, ret],
-                        tf_util.flatgrad(vferr, vf_var_list),
-                    )
+                @contextmanager
+                def timed(msg):
+                    if self.verbose >= 1:
+                        print(colorize(msg, color='magenta'))
+                        start_time = time.time()
+                        yield
+                        print(colorize("done in {:.3f} seconds".format(
+                            (time.time() - start_time)), color='magenta'))
+                    else:
+                        yield
 
-                    @contextmanager
-                    def timed(msg):
-                        if self.verbose >= 1:
-                            print(colorize(msg, color='magenta'))
-                            start_time = time.time()
-                            yield
-                            print(colorize("done in {:.3f} seconds".format(
-                                (time.time() - start_time)), color='magenta'))
-                        else:
-                            yield
+                def allmean(arr):
+                    assert isinstance(arr, np.ndarray)
+                    out = np.empty_like(arr)
+                    MPI.COMM_WORLD.Allreduce(arr, out, op=MPI.SUM)
+                    return out
 
-                    def allmean(arr):
-                        assert isinstance(arr, np.ndarray)
-                        out = np.empty_like(arr)
-                        MPI.COMM_WORLD.Allreduce(arr, out, op=MPI.SUM)
-                        return out
+                tf_util.initialize(sess=self.sess)
 
-                    tf_util.initialize(sess=self.sess)
+                th_init = self.get_flat()
+                MPI.COMM_WORLD.Bcast(th_init, root=0)
+                self.set_from_flat(th_init)
 
-                    th_init = self.get_flat()
-                    MPI.COMM_WORLD.Bcast(th_init, root=0)
-                    self.set_from_flat(th_init)
+            with tf.variable_scope("Adam_mpi", reuse=False):
+                self.vfadam = MpiAdam(vf_var_list, sess=self.sess)
+                self.vfadam.sync()
 
-                with tf.variable_scope("Adam_mpi", reuse=False):
-                    self.vfadam = MpiAdam(vf_var_list, sess=self.sess)
-                    self.vfadam.sync()
+            with tf.variable_scope("input_info", reuse=False):
+                tf.summary.scalar(
+                    'discounted_rewards', tf.reduce_mean(ret))
+                tf.summary.scalar(
+                    'learning_rate', tf.reduce_mean(self.vf_stepsize))
+                tf.summary.scalar(
+                    'advantage', tf.reduce_mean(atarg))
+                tf.summary.scalar(
+                    'kl_clip_range', tf.reduce_mean(self.max_kl))
 
-                with tf.variable_scope("input_info", reuse=False):
-                    tf.summary.scalar(
-                        'discounted_rewards', tf.reduce_mean(ret))
-                    tf.summary.scalar(
-                        'learning_rate', tf.reduce_mean(self.vf_stepsize))
-                    tf.summary.scalar(
-                        'advantage', tf.reduce_mean(atarg))
-                    tf.summary.scalar(
-                        'kl_clip_range', tf.reduce_mean(self.max_kl))
+            self.timed = timed
+            self.allmean = allmean
 
-                self.timed = timed
-                self.allmean = allmean
+            self.step = self.policy_pi.step
+            self.proba_step = self.policy_pi.proba_step
+            self.initial_state = self.policy_pi.initial_state
 
-                self.step = self.policy_pi.step
-                self.proba_step = self.policy_pi.proba_step
-                self.initial_state = self.policy_pi.initial_state
+            self.params = tf_util.get_trainable_vars("model") + \
+                tf_util.get_trainable_vars("oldpi")
 
-                self.params = tf_util.get_trainable_vars("model") + \
-                    tf_util.get_trainable_vars("oldpi")
+            self.summary = tf.summary.merge_all()
 
-                self.summary = tf.summary.merge_all()
-
-                self.compute_lossandgrad = tf_util.function(
-                    [observation, old_policy.obs_ph, action, atarg, ret],
-                    [self.summary, tf_util.flatgrad(optimgain, var_list)]
-                    + losses)
+            self.compute_lossandgrad = tf_util.function(
+                [observation, old_policy.obs_ph, action, atarg, ret],
+                [self.summary, tf_util.flatgrad(optimgain, var_list)]
+                + losses)
 
     def learn(self,
               total_timesteps,
@@ -382,7 +417,7 @@ class TRPO(ActorCriticRLModel):
         new_tb_log = self._init_num_timesteps(reset_num_timesteps)
         callback = self._init_callback(callback)
 
-        with SetVerbosity(self.verbose), TensorboardWriter(
+        with TensorboardWriter(
                 self.graph, self.tensorboard_log, tb_log_name, new_tb_log) \
                 as writer:
             self._setup_learn()
@@ -440,16 +475,6 @@ class TRPO(ActorCriticRLModel):
                     vpredbefore = seg["vpred"]
                     # standardized advantage function estimate
                     atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
-
-                    # true_rew is the reward without discount
-                    if writer is not None:
-                        total_episode_reward_logger(
-                            self.episode_reward,
-                            seg["true_rewards"].reshape((self.n_envs, -1)),
-                            seg["dones"].reshape((self.n_envs, -1)),
-                            writer,
-                            self.num_timesteps,
-                        )
 
                     args = seg["observations"], seg["observations"], \
                         seg["actions"], atarg
