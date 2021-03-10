@@ -1,6 +1,8 @@
 import time
 import tensorflow as tf
 import numpy as np
+import os
+import csv
 from collections import deque
 from mpi4py import MPI
 
@@ -11,7 +13,6 @@ from hbaselines.utils.tf_util import get_trainable_vars
 import stable_baselines.common.tf_util as tf_util
 from stable_baselines.common import dataset
 from stable_baselines.common import ActorCriticRLModel
-from stable_baselines import logger
 from stable_baselines.common.mpi_adam import MpiAdam
 from stable_baselines.common.runners import traj_segment_generator
 
@@ -150,8 +151,6 @@ class TRPO(ActorCriticRLModel):
     :param vf_iters: (int) the value function's number iterations for learning
     :param verbose: (int) the verbosity level: 0 none, 1 training information,
         2 tensorflow debug
-    :param tensorboard_log: (str) the log location for tensorboard (if None, no
-        logging)
     :param _init_setup_model: (bool) Whether or not to build the network at the
         creation of the instance
     :param policy_kwargs: (dict) additional arguments to be passed to the
@@ -175,7 +174,6 @@ class TRPO(ActorCriticRLModel):
                  vf_stepsize=3e-4,
                  vf_iters=3,
                  verbose=0,
-                 tensorboard_log=None,
                  _init_setup_model=True,
                  policy_kwargs=None,
                  seed=None,
@@ -191,6 +189,8 @@ class TRPO(ActorCriticRLModel):
             n_cpu_tf_sess=n_cpu_tf_sess,
         )
 
+        num_envs = 1
+
         self.timesteps_per_batch = timesteps_per_batch
         self.cg_iters = cg_iters
         self.cg_damping = cg_damping
@@ -200,31 +200,44 @@ class TRPO(ActorCriticRLModel):
         self.vf_iters = vf_iters
         self.vf_stepsize = vf_stepsize
         self.entcoeff = entcoeff
-        self.tensorboard_log = tensorboard_log
-
-        self.graph = None
-        self.sess = None
-        self.policy_pi = None
         self.loss_names = None
         self.assign_old_eq_new = None
         self.compute_losses = None
         self.compute_lossandgrad = None
         self.compute_fvp = None
         self.compute_vflossandgrad = None
-        self.d_adam = None
         self.vfadam = None
         self.get_flat = None
         self.set_from_flat = None
-        self.timed = None
-        self.reward_giver = None
-        self.step = None
-        self.proba_step = None
-        self.initial_state = None
         self.params = None
-        self.summary = None
 
+        self._info_keys = []
+
+        # init
+        self.graph = None
+        self.policy_tf = None
+        self.sess = None
+        self.summary = None
+        self.episode_step = [0 for _ in range(num_envs)]
+        self.episodes = 0
+        self.steps = 0
+        self.epoch_episode_steps = []
+        self.epoch_episode_rewards = []
+        self.epoch_episodes = 0
+        self.epoch = 0
+        self.episode_rew_history = deque(maxlen=100)
+        self.episode_reward = [0 for _ in range(num_envs)]
+        self.info_at_done = {key: deque(maxlen=100) for key in self._info_keys}
+        self.info_ph = {}
+        self.rew_ph = None
+        self.rew_history_ph = None
+        self.eval_rew_ph = None
+        self.eval_success_ph = None
+        self.saver = None
+
+        # Create the model variables and operations.
         if _init_setup_model:
-            self.setup_model()
+            self.trainable_vars = self.setup_model()
 
     def setup_model(self):
         np.set_printoptions(precision=3)
@@ -236,7 +249,7 @@ class TRPO(ActorCriticRLModel):
                 num_cpu=self.n_cpu_tf_sess, graph=self.graph)
 
             # Construct network for new policy
-            self.policy_pi = self.policy(
+            self.policy_tf = self.policy(
                 self.sess,
                 self.observation_space,
                 self.action_space,
@@ -266,22 +279,22 @@ class TRPO(ActorCriticRLModel):
                 # Empirical return
                 ret = tf.placeholder(dtype=tf.float32, shape=[None])
 
-                observation = self.policy_pi.obs_ph
-                action = self.policy_pi.pdtype.sample_placeholder([None])
+                observation = self.policy_tf.obs_ph
+                action = self.policy_tf.pdtype.sample_placeholder([None])
 
                 kloldnew = old_policy.proba_distribution.kl(
-                    self.policy_pi.proba_distribution)
-                ent = self.policy_pi.proba_distribution.entropy()
+                    self.policy_tf.proba_distribution)
+                ent = self.policy_tf.proba_distribution.entropy()
                 meankl = tf.reduce_mean(kloldnew)
                 meanent = tf.reduce_mean(ent)
                 entbonus = self.entcoeff * meanent
 
                 vferr = tf.reduce_mean(
-                    tf.square(self.policy_pi.value_flat - ret))
+                    tf.square(self.policy_tf.value_flat - ret))
 
                 # advantage * pnew / pold
                 ratio = tf.exp(
-                    self.policy_pi.proba_distribution.logp(action) -
+                    self.policy_tf.proba_distribution.logp(action) -
                     old_policy.proba_distribution.logp(action))
                 surrgain = tf.reduce_mean(ratio * atarg)
 
@@ -367,10 +380,6 @@ class TRPO(ActorCriticRLModel):
                 tf.summary.scalar(
                     'kl_clip_range', tf.reduce_mean(self.max_kl))
 
-            self.step = self.policy_pi.step
-            self.proba_step = self.policy_pi.proba_step
-            self.initial_state = self.policy_pi.initial_state
-
             self.params = get_trainable_vars("model") + \
                 get_trainable_vars("oldpi")
 
@@ -380,6 +389,8 @@ class TRPO(ActorCriticRLModel):
                 [observation, old_policy.obs_ph, action, atarg, ret],
                 [self.summary, tf_util.flatgrad(optimgain, var_list)]
                 + losses)
+
+        return None
 
     def learn(self,
               total_timesteps,
@@ -396,10 +407,10 @@ class TRPO(ActorCriticRLModel):
 
         with self.sess.as_default():
             seg_gen = traj_segment_generator(
-                self.policy_pi,
+                self.policy_tf,
                 self.env,
                 self.timesteps_per_batch,
-                reward_giver=self.reward_giver,
+                reward_giver=None,
                 gail=False,
                 callback=self._init_callback(callback),
             )
@@ -408,8 +419,6 @@ class TRPO(ActorCriticRLModel):
             timesteps_so_far = 0
             iters_so_far = 0
             t_start = time.time()
-            len_buffer = deque(maxlen=40)
-            reward_buffer = deque(maxlen=40)
 
             while timesteps_so_far < total_timesteps:
 
@@ -418,28 +427,24 @@ class TRPO(ActorCriticRLModel):
                 print("Optimizing Policy...")
 
                 seg = seg_gen.__next__()
-                mean_losses, vpredbefore, tdlamret = self._train(seg)
+                self._train(seg)
 
                 # lr: lengths and rewards
                 lens, rews = (seg["ep_lens"], seg["ep_rets"])
-                len_buffer.extend(lens)
-                reward_buffer.extend(rews)
+                self.epoch_episode_steps = lens
+                self.epoch_episode_rewards = rews
+                self.epoch_episodes = len(rews)
+                self.episode_rew_history.extend(rews)
                 episodes_so_far += len(lens)
                 current_it_timesteps = seg["total_timestep"]
                 timesteps_so_far += current_it_timesteps
                 iters_so_far += 1
-                self.num_timesteps += current_it_timesteps
+                self.steps += current_it_timesteps
+                self.episodes += len(rews)
 
-                self._log_training(
-                    mean_losses,
-                    vpredbefore,
-                    tdlamret,
-                    len_buffer,
-                    reward_buffer,
-                    lens,
-                    episodes_so_far,
-                    t_start,
-                )
+                self._log_training(file_path=None, start_time=t_start)
+
+                self.epoch += 1
 
     def _train(self, seg):
 
@@ -531,37 +536,58 @@ class TRPO(ActorCriticRLModel):
 
         return mean_losses, vpredbefore, tdlamret
 
-    def _log_training(self,
-                      mean_losses,
-                      vpredbefore,
-                      tdlamret,
-                      len_buffer,
-                      reward_buffer,
-                      lens,
-                      episodes_so_far,
-                      t_start):
+    def _log_training(self, file_path, start_time):
+        """Log training statistics.
 
-        for (loss_name, loss_val) in zip(
-                self.loss_names, mean_losses):
-            logger.record_tabular(loss_name, loss_val)
+        Parameters
+        ----------
+        file_path : str
+            the list of cumulative rewards from every episode in the evaluation
+            phase
+        start_time : float
+            the time when training began. This is used to print the total
+            training time.
+        """
+        # Log statistics.
+        duration = time.time() - start_time
 
-        logger.record_tabular(
-            "explained_variance_tdlam_before",
-            explained_variance(vpredbefore, tdlamret))
+        combined_stats = {
+            # Rollout statistics.
+            'rollout/episodes': self.epoch_episodes,
+            'rollout/episode_steps': np.mean(self.epoch_episode_steps),
+            'rollout/return': np.mean(self.epoch_episode_rewards),
+            'rollout/return_history': np.mean(self.episode_rew_history),
 
-        if len(len_buffer) > 0:
-            logger.record_tabular(
-                "EpLenMean", np.mean(len_buffer))
-            logger.record_tabular(
-                "EpRewMean", np.mean(reward_buffer))
-        logger.record_tabular("EpThisIter", len(lens))
+            # Total statistics.
+            'total/epochs': self.epoch + 1,
+            'total/steps': self.steps,
+            'total/duration': duration,
+            'total/steps_per_second': self.steps / duration,
+            'total/episodes': self.episodes,
+        }
 
-        logger.record_tabular("EpisodesSoFar", episodes_so_far)
-        logger.record_tabular("TimestepsSoFar", self.num_timesteps)
-        logger.record_tabular("TimeElapsed", time.time() - t_start)
+        # Information passed by the environment.
+        combined_stats.update({
+            'info_at_done/{}'.format(key): np.mean(self.info_at_done[key])
+            for key in self.info_at_done.keys()
+        })
 
-        if self.verbose >= 1:
-            logger.dump_tabular()
+        # Save combined_stats in a csv file.
+        if file_path is not None:
+            exists = os.path.exists(file_path)
+            with open(file_path, 'a') as f:
+                w = csv.DictWriter(f, fieldnames=combined_stats.keys())
+                if not exists:
+                    w.writeheader()
+                w.writerow(combined_stats)
+
+        # Print statistics.
+        print("-" * 67)
+        for key in sorted(combined_stats.keys()):
+            val = combined_stats[key]
+            print("| {:<30} | {:<30} |".format(key, val))
+        print("-" * 67)
+        print('')
 
     def _get_pretrain_placeholders(self):
         pass
