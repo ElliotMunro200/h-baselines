@@ -4,6 +4,7 @@ import numpy as np
 import os
 import csv
 import random
+import gym
 from collections import deque
 
 from hbaselines.utils.tf_util import make_session
@@ -11,10 +12,164 @@ from hbaselines.utils.tf_util import get_globals_vars
 from hbaselines.utils.tf_util import get_trainable_vars
 
 import stable_baselines.common.tf_util as tf_util
-from stable_baselines.common import dataset
-from stable_baselines.common import ActorCriticRLModel
 from stable_baselines.common.mpi_adam import MpiAdam
-from stable_baselines.common.runners import traj_segment_generator
+
+
+def iterbatches(arrays,
+                *,
+                num_batches=None,
+                batch_size=None,
+                shuffle=True,
+                include_final_partial_batch=True):
+    """
+    Iterates over arrays in batches, must provide either num_batches or batch_size, the other must be None.
+
+    :param arrays: (tuple) a tuple of arrays
+    :param num_batches: (int) the number of batches, must be None is batch_size is defined
+    :param batch_size: (int) the size of the batch, must be None is num_batches is defined
+    :param shuffle: (bool) enable auto shuffle
+    :param include_final_partial_batch: (bool) add the last batch if not the same size as the batch_size
+    :return: (tuples) a tuple of a batch of the arrays
+    """
+    assert (num_batches is None) != (batch_size is None), 'Provide num_batches or batch_size, but not both'
+    arrays = tuple(map(np.asarray, arrays))
+    n_samples = arrays[0].shape[0]
+    assert all(a.shape[0] == n_samples for a in arrays[1:])
+    inds = np.arange(n_samples)
+    if shuffle:
+        np.random.shuffle(inds)
+    sections = np.arange(0, n_samples, batch_size)[1:] if num_batches is None else num_batches
+    for batch_inds in np.array_split(inds, sections):
+        if include_final_partial_batch or len(batch_inds) == batch_size:
+            yield tuple(a[batch_inds] for a in arrays)
+
+
+def traj_segment_generator(policy,
+                           env,
+                           horizon,
+                           reward_giver=None,
+                           gail=False):
+    """
+    Compute target value using TD(lambda) estimator, and advantage with GAE(lambda)
+    :param policy: (MLPPolicy) the policy
+    :param env: (Gym Environment) the environment
+    :param horizon: (int) the number of timesteps to run per batch
+    :param reward_giver: (TransitionClassifier) the reward predicter from obsevation and action
+    :param gail: (bool) Whether we are using this generator for standard trpo or with gail
+    :return: (dict) generator that returns a dict with the following keys:
+        - observations: (np.ndarray) observations
+        - rewards: (numpy float) rewards (if gail is used it is the predicted reward)
+        - true_rewards: (numpy float) if gail is used it is the original reward
+        - vpred: (numpy float) action logits
+        - dones: (numpy bool) dones (is end of episode, used for logging)
+        - episode_starts: (numpy bool)
+            True if first timestep of an episode, used for GAE
+        - actions: (np.ndarray) actions
+        - nextvpred: (numpy float) next action logits
+        - ep_rets: (float) cumulated current episode reward
+        - ep_lens: (int) the length of the current episode
+        - ep_true_rets: (float) the real environment reward
+    """
+    # Check when using GAIL
+    assert not (gail and reward_giver is None), "You must pass a reward giver when using GAIL"
+
+    # Initialize state variables
+    step = 0
+    action = env.action_space.sample()  # not used, just so we have the datatype
+    observation = env.reset()
+
+    cur_ep_ret = 0  # return in current episode
+    current_it_len = 0  # len of current iteration
+    current_ep_len = 0 # len of current episode
+    cur_ep_true_ret = 0
+    ep_true_rets = []
+    ep_rets = []  # returns of completed episodes in this segment
+    ep_lens = []  # Episode lengths
+
+    # Initialize history arrays
+    observations = np.array([observation for _ in range(horizon)])
+    true_rewards = np.zeros(horizon, 'float32')
+    rewards = np.zeros(horizon, 'float32')
+    vpreds = np.zeros(horizon, 'float32')
+    episode_starts = np.zeros(horizon, 'bool')
+    dones = np.zeros(horizon, 'bool')
+    actions = np.array([action for _ in range(horizon)])
+    states = policy.initial_state
+    episode_start = True  # marks if we're on first timestep of an episode
+    done = False
+
+    while True:
+        action, vpred, states, _ = policy.step(observation.reshape(-1, *observation.shape), states, done)
+        # Slight weirdness here because we need value function at time T
+        # before returning segment [0, T-1] so we get the correct
+        # terminal value
+        if step > 0 and step % horizon == 0:
+            yield {
+                    "observations": observations,
+                    "rewards": rewards,
+                    "dones": dones,
+                    "episode_starts": episode_starts,
+                    "true_rewards": true_rewards,
+                    "vpred": vpreds,
+                    "actions": actions,
+                    "nextvpred": vpred[0] * (1 - episode_start),
+                    "ep_rets": ep_rets,
+                    "ep_lens": ep_lens,
+                    "ep_true_rets": ep_true_rets,
+                    "total_timestep": current_it_len,
+                    'continue_training': True
+            }
+            _, vpred, _, _ = policy.step(observation.reshape(-1, *observation.shape))
+            # Be careful!!! if you change the downstream algorithm to aggregate
+            # several of these batches, then be sure to do a deepcopy
+            ep_rets = []
+            ep_true_rets = []
+            ep_lens = []
+            # Reset current iteration length
+            current_it_len = 0
+        i = step % horizon
+        observations[i] = observation
+        vpreds[i] = vpred[0]
+        actions[i] = action[0]
+        episode_starts[i] = episode_start
+
+        clipped_action = action
+        # Clip the actions to avoid out of bound error
+        if isinstance(env.action_space, gym.spaces.Box):
+            clipped_action = np.clip(action, env.action_space.low, env.action_space.high)
+
+        if gail:
+            reward = reward_giver.get_reward(observation, clipped_action[0])
+            observation, true_reward, done, info = env.step(clipped_action[0])
+        else:
+            observation, reward, done, info = env.step(clipped_action[0])
+            true_reward = reward
+
+        rewards[i] = reward
+        true_rewards[i] = true_reward
+        dones[i] = done
+        episode_start = done
+
+        cur_ep_ret += reward
+        cur_ep_true_ret += true_reward
+        current_it_len += 1
+        current_ep_len += 1
+        if done:
+            # Retrieve unnormalized reward if using Monitor wrapper
+            maybe_ep_info = info.get('episode')
+            if maybe_ep_info is not None:
+                if not gail:
+                    cur_ep_ret = maybe_ep_info['r']
+                cur_ep_true_ret = maybe_ep_info['r']
+
+            ep_rets.append(cur_ep_ret)
+            ep_true_rets.append(cur_ep_true_ret)
+            ep_lens.append(current_ep_len)
+            cur_ep_ret = 0
+            cur_ep_true_ret = 0
+            current_ep_len = 0
+            observation = env.reset()
+        step += 1
 
 
 def add_vtarg_and_adv(seg, gamma, lam):
@@ -111,7 +266,7 @@ def conjugate_gradient(f_ax,
     return x_var
 
 
-class TRPO(ActorCriticRLModel):
+class TRPO(object):
     """
     Trust Region Policy Optimization (https://arxiv.org/abs/1502.05477)
 
@@ -342,12 +497,7 @@ class TRPO(ActorCriticRLModel):
 
         return get_trainable_vars("model") + get_trainable_vars("oldpi")
 
-    def learn(self,
-              total_timesteps,
-              callback=None,
-              log_interval=100,
-              tb_log_name="TRPO",
-              reset_num_timesteps=True):
+    def learn(self, total_timesteps):
 
         with self.sess.as_default():
             seg_gen = traj_segment_generator(
@@ -356,7 +506,6 @@ class TRPO(ActorCriticRLModel):
                 self.timesteps_per_batch,
                 reward_giver=None,
                 gail=False,
-                callback=self._init_callback(callback),
             )
 
             episodes_so_far = 0
@@ -476,7 +625,7 @@ class TRPO(ActorCriticRLModel):
 
         for _ in range(self.vf_iters):
             # NOTE: for recurrent policies, use shuffle=False?
-            for (mbob, mbret) in dataset.iterbatches(
+            for (mbob, mbret) in iterbatches(
                     (seg["observations"], seg["tdlamret"]),
                     include_final_partial_batch=False,
                     batch_size=128,
@@ -560,11 +709,436 @@ class TRPO(ActorCriticRLModel):
 
 """TRPO-compatible feedforward policy."""
 
-from stable_baselines.common.policies import mlp_extractor
-from stable_baselines.common.policies import linear
-from stable_baselines.common.policies import make_proba_dist_type
-from stable_baselines.common.policies import observation_input
-from gym.spaces import Discrete
+from itertools import zip_longest
+
+
+def mlp_extractor(flat_observations, net_arch, act_fun):
+    """
+    Constructs an MLP that receives observations as an input and outputs a
+    latent representation for the policy and
+    a value network. The ``net_arch`` parameter allows to specify the amount
+    and size of the hidden layers and how many
+    of them are shared between the policy network and the value network. It is
+    assumed to be a list with the following
+    structure:
+
+    1. An arbitrary length (zero allowed) number of integers each specifying
+    the number of units in a shared layer.
+       If the number of ints is zero, there will be no shared layers.
+    2. An optional dict, to specify the following non-shared layers for the
+    value network and the policy network.
+       It is formatted like ``dict(vf=[<value layer sizes>], pi=[<policy layer
+       sizes>])``.
+       If it is missing any of the keys (pi or vf), no non-shared layers (empty
+       list) is assumed.
+
+    For example to construct a network with one shared layer of size 55
+    followed by two non-shared layers for the value
+    network of size 255 and a single non-shared layer of size 128 for the
+    policy network, the following layers_spec
+    would be used: ``[55, dict(vf=[255, 255], pi=[128])]``. A simple shared
+    network topology with two layers of size 128
+    would be specified as [128, 128].
+
+    :param flat_observations: (tf.Tensor) The observations to base policy and
+        value function on.
+    :param net_arch: ([int or dict]) The specification of the policy and value
+        networks.
+        See above for details on its formatting.
+    :param act_fun: (tf function) The activation function to use for the
+        networks.
+    :return: (tf.Tensor, tf.Tensor) latent_policy, latent_value of the
+        specified network.
+        If all layers are shared, then ``latent_policy == latent_value``
+    """
+    latent = flat_observations
+    # Layer sizes of the network that only belongs to the policy network
+    policy_only_layers = []
+    # Layer sizes of the network that only belongs to the value network
+    value_only_layers = []
+
+    # Iterate through the shared layers and build the shared parts of the
+    # network
+    for idx, layer in enumerate(net_arch):
+        if isinstance(layer, int):  # Check that this is a shared layer
+            layer_size = layer
+            latent = act_fun(linear(
+                latent, "shared_fc{}".format(idx), layer_size,
+                init_scale=np.sqrt(2)))
+        else:
+            assert isinstance(layer, dict), \
+                "Error: the net_arch list can only contain ints and dicts"
+            if 'pi' in layer:
+                assert isinstance(layer['pi'], list), \
+                    "Error: net_arch[-1]['pi'] must contain a list of " \
+                    "integers."
+                policy_only_layers = layer['pi']
+
+            if 'vf' in layer:
+                assert isinstance(layer['vf'], list), \
+                    "Error: net_arch[-1]['vf'] must contain a list of " \
+                    "integers."
+                value_only_layers = layer['vf']
+            # From here on the network splits up in policy and value network
+            break
+
+    # Build the non-shared part of the network
+    latent_policy = latent
+    latent_value = latent
+    for idx, (pi_layer_size, vf_layer_size) in enumerate(
+            zip_longest(policy_only_layers, value_only_layers)):
+        if pi_layer_size is not None:
+            assert isinstance(pi_layer_size, int), \
+                "Error: net_arch[-1]['pi'] must only contain integers."
+            latent_policy = act_fun(linear(
+                latent_policy, "pi_fc{}".format(idx), pi_layer_size,
+                init_scale=np.sqrt(2)))
+
+        if vf_layer_size is not None:
+            assert isinstance(vf_layer_size, int), \
+                "Error: net_arch[-1]['vf'] must only contain integers."
+            latent_value = act_fun(linear(
+                latent_value, "vf_fc{}".format(idx), vf_layer_size,
+                init_scale=np.sqrt(2)))
+
+    return latent_policy, latent_value
+
+
+def ortho_init(scale=1.0):
+    """
+    Orthogonal initialization for the policy weights
+
+    :param scale: (float) Scaling factor for the weights.
+    :return: (function) an initialization function for the weights
+    """
+
+    # _ortho_init(shape, dtype, partition_info=None)
+    def _ortho_init(shape, *_, **_kwargs):
+        """Intialize weights as Orthogonal matrix.
+
+        Orthogonal matrix initialization [1]_. For n-dimensional shapes where
+        n > 2, the n-1 trailing axes are flattened. For convolutional layers,
+        this corresponds to the fan-in, so this makes the initialization usable
+        for both dense and convolutional layers.
+
+        References
+        ----------
+        .. [1] Saxe, Andrew M., James L. McClelland, and Surya Ganguli.
+               "Exact solutions to the nonlinear dynamics of learning in deep
+               linear
+        """
+        # lasagne ortho init for tf
+        shape = tuple(shape)
+        if len(shape) == 2:
+            flat_shape = shape
+        elif len(shape) == 4:  # assumes NHWC
+            flat_shape = (np.prod(shape[:-1]), shape[-1])
+        else:
+            raise NotImplementedError
+        gaussian_noise = np.random.normal(0.0, 1.0, flat_shape)
+        u, _, v = np.linalg.svd(gaussian_noise, full_matrices=False)
+        # pick the one with the correct shape
+        weights = u if u.shape == flat_shape else v
+        weights = weights.reshape(shape)
+        return (scale * weights[:shape[0], :shape[1]]).astype(np.float32)
+
+    return _ortho_init
+
+
+def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
+    """
+    Creates a fully connected layer for TensorFlow
+
+    :param input_tensor: (TensorFlow Tensor) The input tensor for the fully
+        connected layer
+    :param scope: (str) The TensorFlow variable scope
+    :param n_hidden: (int) The number of hidden neurons
+    :param init_scale: (int) The initialization scale
+    :param init_bias: (int) The initialization offset bias
+    :return: (TensorFlow Tensor) fully connected layer
+    """
+    with tf.variable_scope(scope):
+        n_input = input_tensor.get_shape()[1].value
+        weight = tf.get_variable("w", [n_input, n_hidden],
+                                 initializer=ortho_init(init_scale))
+        bias = tf.get_variable("b", [n_hidden],
+                               initializer=tf.constant_initializer(init_bias))
+        return tf.matmul(input_tensor, weight) + bias
+
+
+class ProbabilityDistribution(object):
+    """
+    Base class for describing a probability distribution.
+    """
+    def __init__(self):
+        super(ProbabilityDistribution, self).__init__()
+
+    def flatparam(self):
+        """
+        Return the direct probabilities
+
+        :return: ([float]) the probabilities
+        """
+        raise NotImplementedError
+
+    def mode(self):
+        """
+        Returns the probability
+
+        :return: (Tensorflow Tensor) the deterministic action
+        """
+        raise NotImplementedError
+
+    def neglogp(self, x):
+        """
+        returns the of the negative log likelihood
+
+        :param x: (str) the labels of each index
+        :return: ([float]) The negative log likelihood of the distribution
+        """
+        # Usually it's easier to define the negative logprob
+        raise NotImplementedError
+
+    def kl(self, other):
+        """
+        Calculates the Kullback-Leibler divergence from the given probability
+        distribution
+
+        :param other: ([float]) the distribution to compare with
+        :return: (float) the KL divergence of the two distributions
+        """
+        raise NotImplementedError
+
+    def entropy(self):
+        """
+        Returns Shannon's entropy of the probability
+
+        :return: (float) the entropy
+        """
+        raise NotImplementedError
+
+    def sample(self):
+        """
+        returns a sample from the probability distribution
+
+        :return: (Tensorflow Tensor) the stochastic action
+        """
+        raise NotImplementedError
+
+    def logp(self, x):
+        """
+        returns the of the log likelihood
+
+        :param x: (str) the labels of each index
+        :return: ([float]) The log likelihood of the distribution
+        """
+        return - self.neglogp(x)
+
+
+class DiagGaussianProbabilityDistribution(ProbabilityDistribution):
+    def __init__(self, flat):
+        """
+        Probability distributions from multivariate Gaussian input
+
+        :param flat: ([float]) the multivariate Gaussian input data
+        """
+        self.flat = flat
+        mean, logstd = tf.split(
+            axis=len(flat.shape) - 1, num_or_size_splits=2, value=flat)
+        self.mean = mean
+        self.logstd = logstd
+        self.std = tf.exp(logstd)
+        super(DiagGaussianProbabilityDistribution, self).__init__()
+
+    def flatparam(self):
+        return self.flat
+
+    def mode(self):
+        # Bounds are taken into account outside this class (during training
+        # only)
+        return self.mean
+
+    def neglogp(self, x):
+        return 0.5 * tf.reduce_sum(
+            tf.square((x - self.mean) / self.std), axis=-1) + 0.5 * \
+            np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
+            + tf.reduce_sum(self.logstd, axis=-1)
+
+    def kl(self, other):
+        assert isinstance(other, DiagGaussianProbabilityDistribution)
+        return tf.reduce_sum(
+            other.logstd - self.logstd +
+            (tf.square(self.std) + tf.square(self.mean - other.mean)) /
+            (2.0 * tf.square(other.std)) - 0.5, axis=-1)
+
+    def entropy(self):
+        return tf.reduce_sum(
+            self.logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
+
+    def sample(self):
+        # Bounds are taken into account outside this class (during training
+        # only). Otherwise, it changes the distribution and breaks PPO2 for
+        # instance.
+        return self.mean + self.std * tf.random_normal(
+            tf.shape(self.mean), dtype=self.mean.dtype)
+
+    @classmethod
+    def fromflat(cls, flat):
+        """
+        Create an instance of this from new multivariate Gaussian input
+
+        :param flat: ([float]) the multivariate Gaussian input data
+        :return: (ProbabilityDistribution) the instance from the given
+            multivariate Gaussian input data
+        """
+        return cls(flat)
+
+
+class ProbabilityDistributionType(object):
+    """
+    Parametrized family of probability distributions
+    """
+
+    def probability_distribution_class(self):
+        """
+        returns the ProbabilityDistribution class of this type
+
+        :return: (Type ProbabilityDistribution) the probability distribution
+            class associated
+        """
+        raise NotImplementedError
+
+    def proba_distribution_from_flat(self, flat):
+        """
+        Returns the probability distribution from flat probabilities
+        flat: flattened vector of parameters of probability distribution
+
+        :param flat: ([float]) the flat probabilities
+        :return: (ProbabilityDistribution) the instance of the
+            ProbabilityDistribution associated
+        """
+        return self.probability_distribution_class()(flat)
+
+    def proba_distribution_from_latent(self,
+                                       pi_latent_vector,
+                                       vf_latent_vector,
+                                       init_scale=1.0,
+                                       init_bias=0.0):
+        """
+        returns the probability distribution from latent values
+
+        :param pi_latent_vector: ([float]) the latent pi values
+        :param vf_latent_vector: ([float]) the latent vf values
+        :param init_scale: (float) the initial scale of the distribution
+        :param init_bias: (float) the initial bias of the distribution
+        :return: (ProbabilityDistribution) the instance of the
+            ProbabilityDistribution associated
+        """
+        raise NotImplementedError
+
+    def param_shape(self):
+        """
+        returns the shape of the input parameters
+
+        :return: ([int]) the shape
+        """
+        raise NotImplementedError
+
+    def sample_shape(self):
+        """
+        returns the shape of the sampling
+
+        :return: ([int]) the shape
+        """
+        raise NotImplementedError
+
+    def sample_dtype(self):
+        """
+        returns the type of the sampling
+
+        :return: (type) the type
+        """
+        raise NotImplementedError
+
+    def param_placeholder(self, prepend_shape, name=None):
+        """
+        returns the TensorFlow placeholder for the input parameters
+
+        :param prepend_shape: ([int]) the prepend shape
+        :param name: (str) the placeholder name
+        :return: (TensorFlow Tensor) the placeholder
+        """
+        return tf.placeholder(
+            dtype=tf.float32,
+            shape=prepend_shape + self.param_shape(),
+            name=name)
+
+    def sample_placeholder(self, prepend_shape, name=None):
+        """
+        returns the TensorFlow placeholder for the sampling
+
+        :param prepend_shape: ([int]) the prepend shape
+        :param name: (str) the placeholder name
+        :return: (TensorFlow Tensor) the placeholder
+        """
+        return tf.placeholder(
+            dtype=self.sample_dtype(),
+            shape=prepend_shape + self.sample_shape(),
+            name=name)
+
+
+class DiagGaussianProbabilityDistributionType(ProbabilityDistributionType):
+    def __init__(self, size):
+        """
+        The probability distribution type for multivariate Gaussian input
+
+        :param size: (int) the number of dimensions of the multivariate
+            gaussian
+        """
+        self.size = size
+
+    def probability_distribution_class(self):
+        return DiagGaussianProbabilityDistribution
+
+    def proba_distribution_from_flat(self, flat):
+        """
+        returns the probability distribution from flat probabilities
+
+        :param flat: ([float]) the flat probabilities
+        :return: (ProbabilityDistribution) the instance of the
+            ProbabilityDistribution associated
+        """
+        return self.probability_distribution_class()(flat)
+
+    def proba_distribution_from_latent(self,
+                                       pi_latent_vector,
+                                       vf_latent_vector,
+                                       init_scale=1.0,
+                                       init_bias=0.0):
+        mean = linear(
+            pi_latent_vector,
+            'pi',
+            self.size,
+            init_scale=init_scale,
+            init_bias=init_bias)
+        logstd = tf.get_variable(
+            name='pi/logstd',
+            shape=[1, self.size],
+            initializer=tf.zeros_initializer())
+        pdparam = tf.concat([mean, mean * 0.0 + logstd], axis=1)
+        q_values = linear(
+            vf_latent_vector, 'q', self.size,
+            init_scale=init_scale, init_bias=init_bias)
+        return self.proba_distribution_from_flat(pdparam), mean, q_values
+
+    def param_shape(self):
+        return [2 * self.size]
+
+    def sample_shape(self):
+        return [self.size]
+
+    def sample_dtype(self):
+        return tf.float32
 
 
 class FeedForwardPolicy(object):
@@ -600,24 +1174,27 @@ class FeedForwardPolicy(object):
                  layers=None,
                  net_arch=None,
                  act_fun=tf.tanh):
-        self.n_env = n_env
-        self.n_steps = n_steps
-        self.n_batch = n_batch
-        with tf.variable_scope("input", reuse=False):
-            self._obs_ph, self._processed_obs = observation_input(
-                ob_space, n_batch, scale=False)
-            self._action_ph = None
         self.sess = sess
         self.reuse = reuse
         self.ob_space = ob_space
         self.ac_space = ac_space
-
-        self._pdtype = make_proba_dist_type(ac_space)
+        self.n_env = n_env
+        self.n_steps = n_steps
+        self.n_batch = n_batch
+        self._pdtype = DiagGaussianProbabilityDistributionType(
+            ac_space.shape[0])
         self._policy = None
         self._proba_distribution = None
         self._value_fn = None
         self._action = None
         self._deterministic_action = None
+
+        with tf.variable_scope("input", reuse=False):
+            self.obs_ph = tf.placeholder(
+                shape=(None,) + ob_space.shape,
+                dtype=tf.float32,
+                name="obs_ph")
+            self.action_ph = None
 
         if net_arch is None:
             if layers is None:
@@ -626,7 +1203,7 @@ class FeedForwardPolicy(object):
 
         with tf.variable_scope("model", reuse=reuse):
             pi_latent, vf_latent = mlp_extractor(
-                tf.layers.flatten(self.processed_obs), net_arch, act_fun)
+                tf.layers.flatten(self.obs_ph), net_arch, act_fun)
 
             self._value_fn = linear(vf_latent, 'vf', 1)
 
@@ -718,7 +1295,7 @@ class FeedForwardPolicy(object):
     @property
     def is_discrete(self):
         """bool: is action space discrete."""
-        return isinstance(self.ac_space, Discrete)
+        return False
 
     @property
     def initial_state(self):
@@ -730,26 +1307,3 @@ class FeedForwardPolicy(object):
         assert not self.recurrent, "When using recurrent policies, you must " \
                                    "overwrite `initial_state()` method"
         return None
-
-    @property
-    def obs_ph(self):
-        """tf.Tensor: placeholder for observations, shape (self.n_batch, )
-        + self.ob_space.shape."""
-        return self._obs_ph
-
-    @property
-    def processed_obs(self):
-        """tf.Tensor: processed observations, shape (self.n_batch, ) +
-        self.ob_space.shape.
-
-        The form of processing depends on the type of the observation space,
-        and the parameters
-        whether scale is passed to the constructor; see observation_input for
-        more information."""
-        return self._processed_obs
-
-    @property
-    def action_ph(self):
-        """tf.Tensor: placeholder for actions, shape (self.n_batch, ) +
-        self.ac_space.shape."""
-        return self._action_ph
