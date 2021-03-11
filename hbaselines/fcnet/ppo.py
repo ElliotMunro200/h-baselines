@@ -275,7 +275,7 @@ class FeedForwardPolicy(Policy):
             self.value_flat = self.value_fn[:, 0]
 
         # =================================================================== #
-        # Step 4: Setup the optimizers for the actor and critic.              #
+        # Step 3: Setup the optimizers for the actor and critic.              #
         # =================================================================== #
 
         self.entropy = None
@@ -289,7 +289,7 @@ class FeedForwardPolicy(Policy):
             self._setup_optimizers(scope)
 
         # =================================================================== #
-        # Step 5: Setup the operations for computing model statistics.        #
+        # Step 4: Setup the operations for computing model statistics.        #
         # =================================================================== #
 
         self._setup_stats(scope or "Model")

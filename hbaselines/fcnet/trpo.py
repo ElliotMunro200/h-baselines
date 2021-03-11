@@ -1,464 +1,23 @@
-import time
+"""TRPO-compatible feedforward policy."""
 import tensorflow as tf
 import numpy as np
-import os
-import csv
-import random
-import gym
-from collections import deque
-
-from hbaselines.utils.tf_util import make_session
-from hbaselines.utils.tf_util import get_globals_vars
-from hbaselines.utils.tf_util import get_trainable_vars
-
-import stable_baselines.common.tf_util as tf_util
-
-
-def traj_segment_generator(policy, env, horizon):
-    """
-    Compute target value using TD(lambda) estimator, and advantage with
-    GAE(lambda)
-
-    :param policy: (MLPPolicy) the policy
-    :param env: (Gym Environment) the environment
-    :param horizon: (int) the number of timesteps to run per batch
-    :return: (dict) generator that returns a dict with the following keys:
-        - observations: (np.ndarray) observations
-        - rewards: (numpy float) rewards (if gail is used it is the predicted
-          reward)
-        - vpred: (numpy float) action logits
-        - dones: (numpy bool) dones (is end of episode, used for logging)
-        - episode_starts: (numpy bool)
-            True if first timestep of an episode, used for GAE
-        - actions: (np.ndarray) actions
-        - nextvpred: (numpy float) next action logits
-        - ep_rets: (float) cumulated current episode reward
-        - ep_lens: (int) the length of the current episode
-    """
-    # Initialize state variables
-    step = 0
-    # not used, just so we have the datatype
-    action = env.action_space.sample()
-    observation = env.reset()
-
-    cur_ep_ret = 0  # return in current episode
-    current_it_len = 0  # len of current iteration
-    current_ep_len = 0  # len of current episode
-    ep_rets = []  # returns of completed episodes in this segment
-    ep_lens = []  # Episode lengths
-
-    # Initialize history arrays
-    observations = np.array([observation for _ in range(horizon)])
-    rewards = np.zeros(horizon, 'float32')
-    vpreds = np.zeros(horizon, 'float32')
-    episode_starts = np.zeros(horizon, 'bool')
-    dones = np.zeros(horizon, 'bool')
-    actions = np.array([action for _ in range(horizon)])
-    episode_start = True  # marks if we're on first timestep of an episode
-
-    while True:
-        action, vpred = policy.step(
-            observation.reshape(-1, *observation.shape))
-        # Slight weirdness here because we need value function at time T
-        # before returning segment [0, T-1] so we get the correct
-        # terminal value
-        if step > 0 and step % horizon == 0:
-            yield {
-                    "observations": observations,
-                    "rewards": rewards,
-                    "dones": dones,
-                    "episode_starts": episode_starts,
-                    "vpred": vpreds,
-                    "actions": actions,
-                    "nextvpred": vpred[0] * (1 - episode_start),
-                    "ep_rets": ep_rets,
-                    "ep_lens": ep_lens,
-                    "total_timestep": current_it_len,
-                    'continue_training': True
-            }
-            _, vpred = policy.step(observation.reshape(-1, *observation.shape))
-            # Be careful!!! if you change the downstream algorithm to aggregate
-            # several of these batches, then be sure to do a deepcopy
-            ep_rets = []
-            ep_lens = []
-            # Reset current iteration length
-            current_it_len = 0
-        i = step % horizon
-        observations[i] = observation
-        vpreds[i] = vpred[0]
-        actions[i] = action[0]
-        episode_starts[i] = episode_start
-
-        clipped_action = action
-        # Clip the actions to avoid out of bound error
-        if isinstance(env.action_space, gym.spaces.Box):
-            clipped_action = np.clip(
-                action, env.action_space.low, env.action_space.high)
-
-        observation, reward, done, info = env.step(clipped_action[0])
-
-        rewards[i] = reward
-        dones[i] = done
-        episode_start = done
-
-        cur_ep_ret += reward
-        current_it_len += 1
-        current_ep_len += 1
-        if done:
-            # Retrieve unnormalized reward if using Monitor wrapper
-            maybe_ep_info = info.get('episode')
-            if maybe_ep_info is not None:
-                cur_ep_ret = maybe_ep_info['r']
-
-            ep_rets.append(cur_ep_ret)
-            ep_lens.append(current_ep_len)
-            cur_ep_ret = 0
-            current_ep_len = 0
-            observation = env.reset()
-        step += 1
-
-
-def add_vtarg_and_adv(seg, gamma, lam):
-    """
-    Compute target value using TD(lambda) estimator, and advantage with GAE
-    (lambda)
-
-    :param seg: (dict) the current segment of the trajectory (see
-        traj_segment_generator return for more information)
-    :param gamma: (float) Discount factor
-    :param lam: (float) GAE factor
-    """
-    # last element is only used for last vtarg, but we already zeroed it if
-    # last new = 1
-    episode_starts = np.append(seg["episode_starts"], False)
-    vpred = np.append(seg["vpred"], seg["nextvpred"])
-    rew_len = len(seg["rewards"])
-    seg["adv"] = np.empty(rew_len, 'float32')
-    rewards = seg["rewards"]
-    lastgaelam = 0
-    for step in reversed(range(rew_len)):
-        nonterminal = 1 - float(episode_starts[step + 1])
-        delta = \
-            rewards[step] + gamma * vpred[step + 1] * nonterminal - vpred[step]
-        seg["adv"][step] = \
-            lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
-    seg["tdlamret"] = seg["adv"] + seg["vpred"]
-
-
-def conjugate_gradient(f_ax,
-                       b_vec,
-                       cg_iters=10,
-                       verbose=False,
-                       residual_tol=1e-10):
-    """Calculate the conjugate gradient of Ax = b.
-
-    Based on https://epubs.siam.org/doi/book/10.1137/1.9781611971446 Demmel
-    p 312.
-
-    Parameters
-    ----------
-    f_ax : function
-        The function describing the Matrix A dot the vector x (x being the
-        input parameter of the function)
-    b_vec : array_like
-        vector b, where Ax = b
-    cg_iters : int
-        the maximum number of iterations for converging
-    verbose : bool
-        print extra information
-    residual_tol : float
-        the break point if the residual is below this value
-
-    Returns
-    -------
-    array_like
-        vector x, where Ax = b
-    """
-    first_basis_vect = b_vec.copy()  # the first basis vector
-    residual = b_vec.copy()  # the residual
-    x_var = np.zeros_like(b_vec)  # vector x, where Ax = b
-    residual_dot_residual = residual.dot(residual)  # L2 norm of the residual
-
-    fmt_str = "%10i %10.3g %10.3g"
-    title_str = "%10s %10s %10s"
-    if verbose:
-        print(title_str % ("iter", "residual norm", "soln norm"))
-
-    for i in range(cg_iters):
-        if verbose:
-            print(fmt_str % (i, residual_dot_residual, np.linalg.norm(x_var)))
-        z_var = f_ax(first_basis_vect)
-        v_var = residual_dot_residual / first_basis_vect.dot(z_var)
-        x_var += v_var * first_basis_vect
-        residual -= v_var * z_var
-        new_residual_dot_residual = residual.dot(residual)
-        mu_val = new_residual_dot_residual / residual_dot_residual
-        first_basis_vect = residual + mu_val * first_basis_vect
-
-        residual_dot_residual = new_residual_dot_residual
-        if residual_dot_residual < residual_tol:
-            break
-
-    if verbose:
-        print(fmt_str %
-              (cg_iters, residual_dot_residual, np.linalg.norm(x_var)))
-    return x_var
-
-
-class TRPO(object):
-    """
-    Trust Region Policy Optimization (https://arxiv.org/abs/1502.05477)
-
-    :param policy: (ActorCriticPolicy or str) The policy model to use
-        (MlpPolicy, CnnPolicy, CnnLstmPolicy, ...)
-    :param env: (Gym environment or str) The environment to learn from (if
-        registered in Gym, can be str)
-    :param gamma: (float) the discount value
-    :param timesteps_per_batch: (int) the number of timesteps to run per batch
-        (horizon)
-    :param max_kl: (float) the Kullback-Leibler loss threshold
-    :param cg_iters: (int) the number of iterations for the conjugate gradient
-        calculation
-    :param lam: (float) GAE factor
-    :param entcoeff: (float) the weight for the entropy loss
-    :param cg_damping: (float) the compute gradient dampening factor
-    :param vf_stepsize: (float) the value function stepsize
-    :param vf_iters: (int) the value function's number iterations for learning
-    :param verbose: (int) the verbosity level: 0 none, 1 training information,
-        2 tensorflow debug
-    :param _init_setup_model: (bool) Whether or not to build the network at the
-        creation of the instance
-    :param policy_kwargs: (dict) additional arguments to be passed to the
-        policy on creation
-    :param seed: (int) Seed for the pseudo-random generators (python, numpy,
-        tensorflow)
-    """
-
-    def __init__(self,
-                 policy,
-                 env,
-                 gamma=0.99,
-                 timesteps_per_batch=1024,
-                 max_kl=0.01,
-                 cg_iters=10,
-                 lam=0.98,
-                 entcoeff=0.0,
-                 cg_damping=1e-2,
-                 vf_stepsize=3e-4,
-                 vf_iters=3,
-                 verbose=0,
-                 _init_setup_model=True,
-                 policy_kwargs=None,
-                 seed=None):
-        self.policy = policy
-        self.env = env
-        self.verbose = verbose
-        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
-        self.observation_space = env.observation_space
-        self.action_space = env.action_space
-        self.seed = seed
-
-        num_envs = 1
-
-        self.timesteps_per_batch = timesteps_per_batch
-        self.cg_iters = cg_iters
-        self.cg_damping = cg_damping
-        self.gamma = gamma
-        self.lam = lam
-        self.max_kl = max_kl
-        self.vf_iters = vf_iters
-        self.vf_stepsize = vf_stepsize
-        self.entcoeff = entcoeff
-        self.assign_old_eq_new = None
-        self.get_flat = None
-        self.set_from_flat = None
-
-        self._info_keys = []
-
-        # init
-        self.graph = None
-        self.policy_tf = None
-        self.sess = None
-        self.summary = None
-        self.episode_step = [0 for _ in range(num_envs)]
-        self.episodes = 0
-        self.steps = 0
-        self.epoch_episode_steps = []
-        self.epoch_episode_rewards = []
-        self.epoch_episodes = 0
-        self.epoch = 0
-        self.episode_rew_history = deque(maxlen=100)
-        self.episode_reward = [0 for _ in range(num_envs)]
-        self.info_at_done = {key: deque(maxlen=100) for key in self._info_keys}
-        self.info_ph = {}
-        self.rew_ph = None
-        self.rew_history_ph = None
-        self.eval_rew_ph = None
-        self.eval_success_ph = None
-        self.saver = None
-
-        # Create the model variables and operations.
-        if _init_setup_model:
-            self.trainable_vars = self.setup_model()
-
-    def setup_model(self):
-        np.set_printoptions(precision=3)
-
-        self.graph = tf.Graph()
-        with self.graph.as_default():
-            tf.set_random_seed(self.seed)
-            np.random.seed(self.seed)
-            random.seed(self.seed)
-
-            self.sess = make_session(num_cpu=3, graph=self.graph)
-
-            # Construct network for new policy
-            self.policy_tf = self.policy(
-                sess=self.sess,
-                ob_space=self.observation_space,
-                ac_space=self.action_space,
-                co_space=None,
-                verbose=self.verbose,
-                model_params=dict(
-                    model_type="fcnet",
-                    layers=[256, 256],
-                    layer_norm=False,
-                    batch_norm=False,
-                    dropout=False,
-                    act_fun=tf.nn.relu,
-                    ignore_flat_channels=[],
-                    ignore_image=False,
-                    image_height=32,
-                    image_width=32,
-                    image_channels=3,
-                    filters=[16, 16, 16],
-                    kernel_sizes=[5, 5, 5],
-                    strides=[2, 2, 2],
-                ),
-                gamma=self.gamma,
-                lam=self.lam,
-                ent_coef=self.entcoeff,
-                cg_iters=self.cg_iters,
-                vf_iters=self.vf_iters,
-                vf_stepsize=self.vf_stepsize,
-                cg_damping=self.cg_damping,
-                max_kl=self.max_kl,
-                l2_penalty=0,
-                scope=None,
-                num_envs=1,
-            )
-
-        return get_trainable_vars("model") + get_trainable_vars("oldpi")
-
-    def learn(self, total_timesteps):
-
-        with self.sess.as_default():
-            seg_gen = traj_segment_generator(
-                self.policy_tf,
-                self.env,
-                self.timesteps_per_batch,
-            )
-
-            episodes_so_far = 0
-            timesteps_so_far = 0
-            iters_so_far = 0
-            t_start = time.time()
-
-            while timesteps_so_far < total_timesteps:
-
-                print("********* Iteration %i ***********" % iters_so_far)
-
-                print("Optimizing Policy...")
-
-                seg = seg_gen.__next__()
-                self._train(seg)
-
-                # lr: lengths and rewards
-                lens, rews = (seg["ep_lens"], seg["ep_rets"])
-                self.epoch_episode_steps = lens
-                self.epoch_episode_rewards = rews
-                self.epoch_episodes = len(rews)
-                self.episode_rew_history.extend(rews)
-                episodes_so_far += len(lens)
-                current_it_timesteps = seg["total_timestep"]
-                timesteps_so_far += current_it_timesteps
-                iters_so_far += 1
-                self.steps += current_it_timesteps
-                self.episodes += len(rews)
-
-                self._log_training(file_path=None, start_time=t_start)
-
-                self.epoch += 1
-
-    def _train(self, seg):
-        self.policy_tf.update(seg=seg)
-
-    def _log_training(self, file_path, start_time):
-        """Log training statistics.
-
-        Parameters
-        ----------
-        file_path : str
-            the list of cumulative rewards from every episode in the evaluation
-            phase
-        start_time : float
-            the time when training began. This is used to print the total
-            training time.
-        """
-        # Log statistics.
-        duration = time.time() - start_time
-
-        combined_stats = {
-            # Rollout statistics.
-            'rollout/episodes': self.epoch_episodes,
-            'rollout/episode_steps': np.mean(self.epoch_episode_steps),
-            'rollout/return': np.mean(self.epoch_episode_rewards),
-            'rollout/return_history': np.mean(self.episode_rew_history),
-
-            # Total statistics.
-            'total/epochs': self.epoch + 1,
-            'total/steps': self.steps,
-            'total/duration': duration,
-            'total/steps_per_second': self.steps / duration,
-            'total/episodes': self.episodes,
-        }
-
-        # Information passed by the environment.
-        combined_stats.update({
-            'info_at_done/{}'.format(key): np.mean(self.info_at_done[key])
-            for key in self.info_at_done.keys()
-        })
-
-        # Save combined_stats in a csv file.
-        if file_path is not None:
-            exists = os.path.exists(file_path)
-            with open(file_path, 'a') as f:
-                w = csv.DictWriter(f, fieldnames=combined_stats.keys())
-                if not exists:
-                    w.writeheader()
-                w.writerow(combined_stats)
-
-        # Print statistics.
-        print("-" * 67)
-        for key in sorted(combined_stats.keys()):
-            val = combined_stats[key]
-            print("| {:<30} | {:<30} |".format(key, val))
-        print("-" * 67)
-        print('')
-
-
-# =========================================================================== #
-#                                    Policy                                   #
-# =========================================================================== #
-
-"""TRPO-compatible feedforward policy."""
 
 from hbaselines.base_policies import Policy
 from hbaselines.utils.tf_util import create_fcnet
 from hbaselines.utils.tf_util import create_conv
+from hbaselines.utils.tf_util import print_params_shape
+from hbaselines.utils.tf_util import process_minibatch
+from hbaselines.utils.tf_util import get_globals_vars
+from hbaselines.utils.tf_util import get_trainable_vars
+from hbaselines.utils.tf_util import flatgrad
+from hbaselines.utils.tf_util import SetFromFlat
+from hbaselines.utils.tf_util import GetFlat
 
 
 class FeedForwardPolicy(Policy):
+    """TODO.
+
+    """
 
     def __init__(self,
                  sess,
@@ -541,7 +100,6 @@ class FeedForwardPolicy(Policy):
         self.mb_contexts = [[] for _ in range(num_envs)]
         self.mb_actions = [[] for _ in range(num_envs)]
         self.mb_values = [[] for _ in range(num_envs)]
-        self.mb_neglogpacs = [[] for _ in range(num_envs)]
         self.mb_dones = [[] for _ in range(num_envs)]
         self.mb_all_obs = [[] for _ in range(num_envs)]
         self.mb_returns = [[] for _ in range(num_envs)]
@@ -557,10 +115,6 @@ class FeedForwardPolicy(Policy):
         # =================================================================== #
 
         with tf.compat.v1.variable_scope("input", reuse=False):
-            self.rew_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,),
-                name='rewards')
             self.action_ph = tf.compat.v1.placeholder(
                 tf.float32,
                 shape=(None,) + ac_space.shape,
@@ -577,10 +131,6 @@ class FeedForwardPolicy(Policy):
                 tf.float32,
                 shape=(None,),
                 name="advs_ph")
-            self.old_neglog_pac_ph = tf.compat.v1.placeholder(
-                tf.float32,
-                shape=(None,),
-                name="old_neglog_pac_ph")
             self.old_vpred_ph = tf.compat.v1.placeholder(
                 tf.float32,
                 shape=(None,),
@@ -607,9 +157,6 @@ class FeedForwardPolicy(Policy):
                 self.obs_ph, scope="pi")
             self.pi_std = tf.exp(self.pi_logstd)
 
-            # Create a method the log-probability of current actions.
-            self.neglogp = self._neglogp(self.action)
-
             # Create the value function.
             self.value_fn = self.make_critic(self.obs_ph, scope="vf")
             self.value_flat = self.value_fn[:, 0]
@@ -620,9 +167,6 @@ class FeedForwardPolicy(Policy):
             self.old_action, self.old_pi_mean, self.old_pi_logstd = \
                 self.make_actor(self.obs_ph, scope="pi")
             self.old_pi_std = tf.exp(self.old_pi_logstd)
-
-            # Create a method the log-probability of current actions.
-            self.old_neglogp = self._neglogp(self.old_action)
 
             # Create the value function.
             self.old_value_fn = self.make_critic(self.obs_ph, scope="vf")
@@ -772,8 +316,24 @@ class FeedForwardPolicy(Policy):
 
     def _setup_optimizers(self, scope):
         """Create the actor and critic optimizers."""
+        scope_name = 'model/'
+        old_scope_name = "oldpi/"
+        if scope is not None:
+            scope_name = scope + '/' + scope_name
+            old_scope_name = scope + '/' + old_scope_name
+
+        if self.verbose >= 2:
+            print('setting up actor optimizer')
+            print_params_shape("{}pi/".format(scope_name), "actor")
+            print('setting up critic optimizer')
+            print_params_shape("{}vf/".format(scope_name), "critic")
+
+        # =================================================================== #
+        # Create the policy loss and optimizers.                              #
+        # =================================================================== #
+
         with tf.variable_scope("loss", reuse=False):
-            # TODO
+            # Compute the KL divergence.
             kloldnew = tf.reduce_sum(
                 self.pi_logstd - self.old_pi_logstd + (
                     tf.square(self.old_pi_std) +
@@ -781,7 +341,7 @@ class FeedForwardPolicy(Policy):
                 / (2.0 * tf.square(self.pi_std)) - 0.5, axis=-1)
             meankl = tf.reduce_mean(kloldnew)
 
-            # TODO
+            # Compute the entropy bonus.
             entropy = tf.reduce_sum(
                 self.pi_logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
             meanent = tf.reduce_mean(entropy)
@@ -804,16 +364,15 @@ class FeedForwardPolicy(Policy):
                 v for v in all_var_list
                 if "/pi" not in v.name and "/logstd" not in v.name]
 
-            self.get_flat = tf_util.GetFlat(var_list, sess=self.sess)
-            self.set_from_flat = tf_util.SetFromFlat(
-                var_list, sess=self.sess)
+            self.get_flat = GetFlat(var_list, sess=self.sess)
+            self.set_from_flat = SetFromFlat(var_list, sess=self.sess)
 
             klgrads = tf.gradients(meankl, var_list)
             shapes = [var.get_shape().as_list() for var in var_list]
             start = 0
             tangents = []
             for shape in shapes:
-                var_size = tf_util.intprod(shape)
+                var_size = int(np.prod(shape))
                 tangents.append(tf.reshape(
                     self.flat_tangent[start: start + var_size], shape))
                 start += var_size
@@ -821,13 +380,21 @@ class FeedForwardPolicy(Policy):
                 [tf.reduce_sum(grad * tangent)
                  for (grad, tangent) in zip(klgrads, tangents)])
             # Fisher vector products
-            self.fvp = tf_util.flatgrad(gvp, var_list)
+            self.fvp = flatgrad(gvp, var_list)
 
-            self.assign_old_eq_new = tf.group(*[
-                tf.assign(oldv, newv) for (oldv, newv) in
-                zip(get_globals_vars("oldpi"), get_globals_vars("model"))])
+        # =================================================================== #
+        # Update the old model to match the new one.                          #
+        # =================================================================== #
 
-        # Create the value function optimizer.
+        self.assign_old_eq_new = tf.group(
+            *[tf.assign(oldv, newv) for (oldv, newv) in
+              zip(get_globals_vars(old_scope_name),
+                  get_globals_vars(scope_name))])
+
+        # =================================================================== #
+        # Create the value function optimizer.                                #
+        # =================================================================== #
+
         vferr = tf.reduce_mean(tf.square(
             self.value_flat - self.ret_ph))
         optimizer = tf.compat.v1.train.AdamOptimizer(self.vf_stepsize)
@@ -843,7 +410,7 @@ class FeedForwardPolicy(Policy):
         th_init = self.get_flat()
         self.set_from_flat(th_init)
 
-        self.grad = tf_util.flatgrad(optimgain, var_list)
+        self.grad = flatgrad(optimgain, var_list)
 
     def _setup_stats(self, base):
         """Create the running means and std of the model inputs and outputs.
@@ -853,26 +420,135 @@ class FeedForwardPolicy(Policy):
         """
         pass  # TODO
 
-    def update(self, update_actor=True, **kwargs):
-        seg = kwargs["seg"]
-        add_vtarg_and_adv(seg, self.gamma, self.lam)
+    def get_action(self, obs, context, apply_noise, random_actions, env_num=0):
+        """See parent class."""
+        # Add the contextual observation, if applicable.
+        obs = self._get_obs(obs, context, axis=1)
 
-        self.update_from_batch(
-            obs=seg["observations"],
-            returns=seg["tdlamret"],
-            actions=seg["actions"],
-            advs=seg["adv"],
+        action, values = self.sess.run(
+            [self.action if apply_noise else self.pi_mean, self.value_flat],
+            feed_dict={
+                self.obs_ph: obs,
+                self.phase_ph: 0,
+                self.rate_ph: 0.0,
+            }
         )
 
-    def update_from_batch(self, obs, returns, actions, advs):
-        """
+        # Store information on the values and negative-log likelihood.
+        self.mb_values[env_num].append(values)
 
-        :param obs:
-        :param returns:
-        :param actions:
-        :param advs:
-        :return:
+        return action
+
+    def store_transition(self, obs0, context0, action, reward, obs1, context1,
+                         done, is_final_step, env_num=0, evaluate=False):
+        """Store a transition in the replay buffer.
+
+        Parameters
+        ----------
+        obs0 : array_like
+            the last observation
+        context0 : array_like or None
+            the last contextual term. Set to None if no context is provided by
+            the environment.
+        action : array_like
+            the action
+        reward : float
+            the reward
+        obs1 : array_like
+            the current observation
+        context1 : array_like or None
+            the current contextual term. Set to None if no context is provided
+            by the environment.
+        done : float
+            is the episode done
+        is_final_step : bool
+            whether the time horizon was met in the step corresponding to the
+            current sample. This is used by the TD3 algorithm to augment the
+            done mask.
+        env_num : int
+            the environment number. Used to handle situations when multiple
+            parallel environments are being used.
+        evaluate : bool
+            whether the sample is being provided by the evaluation environment.
+            If so, the data is not stored in the replay buffer.
         """
+        # Update the minibatch of samples.
+        self.mb_rewards[env_num].append(reward)
+        self.mb_obs[env_num].append(obs0.reshape(1, -1))
+        self.mb_contexts[env_num].append(context0)
+        self.mb_actions[env_num].append(action.reshape(1, -1))
+        self.mb_dones[env_num].append(done)
+
+        # Update the last observation (to compute the last value for the GAE
+        # expected returns).
+        self.last_obs[env_num] = self._get_obs([obs1], context1)
+
+    def update(self, **kwargs):
+        """See parent class."""
+        # Compute the last estimated value.
+        last_values = [
+            self.sess.run(
+                self.value_flat,
+                feed_dict={
+                    self.obs_ph: self.last_obs[env_num],
+                    self.phase_ph: 0,
+                    self.rate_ph: 0.0,
+                })
+            for env_num in range(self.num_envs)
+        ]
+
+        (self.mb_obs,
+         self.mb_contexts,
+         self.mb_actions,
+         self.mb_values,
+         _,
+         self.mb_all_obs,
+         self.mb_rewards,
+         self.mb_returns,
+         self.mb_dones,
+         self.mb_advs, n_steps) = process_minibatch(
+            mb_obs=self.mb_obs,
+            mb_contexts=self.mb_contexts,
+            mb_actions=self.mb_actions,
+            mb_values=self.mb_values,
+            mb_neglogpacs=None,
+            mb_all_obs=self.mb_all_obs,
+            mb_rewards=self.mb_rewards,
+            mb_returns=self.mb_returns,
+            mb_dones=self.mb_dones,
+            last_values=last_values,
+            gamma=self.gamma,
+            lam=self.lam,
+            num_envs=self.num_envs,
+        )
+
+        self.update_from_batch(
+            obs=self.mb_obs,
+            context=None if self.mb_contexts[0] is None else self.mb_contexts,
+            returns=self.mb_returns,
+            actions=self.mb_actions,
+            advs=self.mb_advs,
+        )
+
+    def update_from_batch(self, obs, context, returns, actions, advs):
+        """Perform gradient update step given a batch of data.
+
+        Parameters
+        ----------
+        obs : array_like
+            a minibatch of observations
+        context : array_like
+            a minibatch of contextual terms
+        returns : array_like
+            a minibatch of contextual expected discounted returns
+        actions : array_like
+            a minibatch of actions
+        advs : array_like
+            a minibatch of estimated advantages
+        """
+        # Add the contextual observation, if applicable.
+        obs = self._get_obs(obs, context, axis=1)
+
         def fisher_vector_product(vec):
             return self.sess.run(self.fvp, feed_dict={
                 self.flat_tangent: vec,
@@ -881,15 +557,12 @@ class FeedForwardPolicy(Policy):
                 self.advs_ph: fvpargs[2],
             }) + self.cg_damping * vec
 
-        atarg, tdlamret = advs, returns
-
         # standardized advantage function estimate
-        atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
-
-        args = obs, actions, atarg
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
         # Subsampling: see p40-42 of John Schulman thesis
         # http://joschu.net/docs/thesis.pdf
+        args = obs, actions, advs
         fvpargs = [arr[::5] for arr in args]
 
         self.sess.run(self.assign_old_eq_new)
@@ -901,8 +574,8 @@ class FeedForwardPolicy(Policy):
             feed_dict={
                 self.obs_ph: obs,
                 self.action_ph: actions,
-                self.advs_ph: atarg,
-                self.ret_ph: tdlamret,
+                self.advs_ph: advs,
+                self.ret_ph: returns,
             }
         )
 
@@ -910,7 +583,7 @@ class FeedForwardPolicy(Policy):
         if np.allclose(grad, 0):
             print("Got zero gradient. not updating")
         else:
-            stepdir = conjugate_gradient(
+            stepdir = self.conjugate_gradient(
                 fisher_vector_product,
                 grad,
                 cg_iters=self.cg_iters,
@@ -933,7 +606,7 @@ class FeedForwardPolicy(Policy):
                     feed_dict={
                         self.obs_ph: obs,
                         self.action_ph: actions,
-                        self.advs_ph: atarg,
+                        self.advs_ph: advs,
                     }
                 )
                 improve = surr - surrbefore
@@ -965,28 +638,71 @@ class FeedForwardPolicy(Policy):
                     self.ret_ph: mbret,
                 })
 
+    def get_td_map(self):
+        """See parent class."""
+        # Add the contextual observation, if applicable.
+        context = None if self.mb_contexts[0] is None else self.mb_contexts
+        obs = self._get_obs(self.mb_obs, context, axis=1)
+
+        td_map = self.get_td_map_from_batch(
+            obs=obs.copy(),
+            mb_actions=self.mb_actions,
+            mb_advs=self.mb_advs,
+            mb_returns=self.mb_returns,
+            mb_values=self.mb_values,
+        )
+
+        # Clear memory
+        self.mb_rewards = [[] for _ in range(self.num_envs)]
+        self.mb_obs = [[] for _ in range(self.num_envs)]
+        self.mb_contexts = [[] for _ in range(self.num_envs)]
+        self.mb_actions = [[] for _ in range(self.num_envs)]
+        self.mb_values = [[] for _ in range(self.num_envs)]
+        self.mb_dones = [[] for _ in range(self.num_envs)]
+        self.mb_all_obs = [[] for _ in range(self.num_envs)]
+        self.mb_returns = [[] for _ in range(self.num_envs)]
+        self.last_obs = [None for _ in range(self.num_envs)]
+        self.mb_advs = None
+
+        return td_map
+
+    def get_td_map_from_batch(self,
+                              obs,
+                              mb_actions,
+                              mb_advs,
+                              mb_returns,
+                              mb_values):
+        """Convert a batch to a td_map."""
+        return {
+            self.obs_ph: obs,
+            self.action_ph: mb_actions,
+            self.advs_ph: mb_advs,
+            self.ret_ph: mb_returns,
+            self.old_vpred_ph: mb_values,
+            self.phase_ph: 0,
+            self.rate_ph: 0.0,
+        }
+
     def initialize(self):
         """See parent class."""
         pass
 
-    def step(self, obs):
-        action, value = self.sess.run(
-            [self.action, self.value_flat], feed_dict={self.obs_ph: obs})
-        return action, value
-
     def logp(self, x, old=False):
+        """Return the logp of an action from the old or current policy."""
         if old:
             return - self._old_neglogp(x)
         else:
             return - self._neglogp(x)
 
     def _neglogp(self, x):
+        """Return the negative-logp of the current policy."""
         return 0.5 * tf.reduce_sum(
             tf.square((x - self.pi_mean) / self.pi_std), axis=-1) + 0.5 * \
             np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
             + tf.reduce_sum(self.pi_logstd, axis=-1)
 
     def _old_neglogp(self, x):
+        """Return the negative-logp of the previous policy."""
         return 0.5 * tf.reduce_sum(
             tf.square((x - self.old_pi_mean) / self.old_pi_std), axis=-1) \
             + 0.5 * np.log(2. * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
@@ -1034,3 +750,68 @@ class FeedForwardPolicy(Policy):
         for batch_inds in np.array_split(inds, sections):
             if include_final_partial_batch or len(batch_inds) == batch_size:
                 yield tuple(a[batch_inds] for a in arrays)
+
+    @staticmethod
+    def conjugate_gradient(f_ax,
+                           b_vec,
+                           cg_iters=10,
+                           verbose=False,
+                           residual_tol=1e-10):
+        """Calculate the conjugate gradient of Ax = b.
+
+        Based on https://epubs.siam.org/doi/book/10.1137/1.9781611971446 Demmel
+        p 312.
+
+        Parameters
+        ----------
+        f_ax : function
+            The function describing the Matrix A dot the vector x (x being the
+            input parameter of the function)
+        b_vec : array_like
+            vector b, where Ax = b
+        cg_iters : int
+            the maximum number of iterations for converging
+        verbose : bool
+            print extra information
+        residual_tol : float
+            the break point if the residual is below this value
+
+        Returns
+        -------
+        array_like
+            vector x, where Ax = b
+        """
+        # the first basis vector
+        first_basis_vect = b_vec.copy()
+        # the residual
+        residual = b_vec.copy()
+        # vector x, where Ax = b
+        x_var = np.zeros_like(b_vec)
+        # L2 norm of the residual
+        residual_dot_residual = residual.dot(residual)
+
+        fmt_str = "%10i %10.3g %10.3g"
+        title_str = "%10s %10s %10s"
+        if verbose:
+            print(title_str % ("iter", "residual norm", "soln norm"))
+
+        for i in range(cg_iters):
+            if verbose:
+                print(fmt_str %
+                      (i, residual_dot_residual, np.linalg.norm(x_var)))
+            z_var = f_ax(first_basis_vect)
+            v_var = residual_dot_residual / first_basis_vect.dot(z_var)
+            x_var += v_var * first_basis_vect
+            residual -= v_var * z_var
+            new_residual_dot_residual = residual.dot(residual)
+            mu_val = new_residual_dot_residual / residual_dot_residual
+            first_basis_vect = residual + mu_val * first_basis_vect
+
+            residual_dot_residual = new_residual_dot_residual
+            if residual_dot_residual < residual_tol:
+                break
+
+        if verbose:
+            print(fmt_str %
+                  (cg_iters, residual_dot_residual, np.linalg.norm(x_var)))
+        return x_var

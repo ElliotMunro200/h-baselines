@@ -110,6 +110,98 @@ def reduce_var(tensor, axis=None, keepdims=False):
     return tf.reduce_mean(devs_squared, axis=axis, keepdims=keepdims)
 
 
+def var_shape(tensor):
+    """
+    get TensorFlow Tensor shape
+
+    :param tensor: (TensorFlow Tensor) the input tensor
+    :return: ([int]) the shape
+    """
+    out = tensor.get_shape().as_list()
+    assert all(isinstance(a, int) for a in out), \
+        "shape function assumes that shape is fully known"
+    return out
+
+
+def numel(tensor):
+    """
+    get TensorFlow Tensor's number of elements
+
+    :param tensor: (TensorFlow Tensor) the input tensor
+    :return: (int) the number of elements
+    """
+    return int(np.prod(var_shape(tensor)))
+
+
+def flatgrad(loss, var_list, clip_norm=None):
+    """
+    calculates the gradient and flattens it
+
+    :param loss: (float) the loss value
+    :param var_list: ([TensorFlow Tensor]) the variables
+    :param clip_norm: (float) clip the gradients (disabled if None)
+    :return: ([TensorFlow Tensor]) flattened gradient
+    """
+    grads = tf.gradients(loss, var_list)
+    if clip_norm is not None:
+        grads = [tf.clip_by_norm(grad, clip_norm=clip_norm) for grad in grads]
+    return tf.concat(axis=0, values=[
+        tf.reshape(grad if grad is not None else tf.zeros_like(v), [numel(v)])
+        for (v, grad) in zip(var_list, grads)
+    ])
+
+
+class SetFromFlat(object):
+    def __init__(self, var_list, dtype=tf.float32, sess=None):
+        """
+        Set the parameters from a flat vector
+
+        :param var_list: ([TensorFlow Tensor]) the variables
+        :param dtype: (type) the type for the placeholder
+        :param sess: (TensorFlow Session)
+        """
+        shapes = list(map(var_shape, var_list))
+        total_size = np.sum([int(np.prod(shape)) for shape in shapes])
+
+        self.theta = theta = tf.placeholder(dtype, [total_size])
+        start = 0
+        assigns = []
+        for (shape, _var) in zip(shapes, var_list):
+            size = int(np.prod(shape))
+            assigns.append(tf.assign(
+                _var, tf.reshape(theta[start:start + size], shape)))
+            start += size
+        self.operation = tf.group(*assigns)
+        self.sess = sess
+
+    def __call__(self, theta):
+        if self.sess is None:
+            return tf.get_default_session().run(
+                self.operation, feed_dict={self.theta: theta})
+        else:
+            return self.sess.run(
+                self.operation, feed_dict={self.theta: theta})
+
+
+class GetFlat(object):
+    def __init__(self, var_list, sess=None):
+        """
+        Get the parameters as a flat vector
+
+        :param var_list: ([TensorFlow Tensor]) the variables
+        :param sess: (TensorFlow Session)
+        """
+        self.operation = tf.concat(
+            axis=0, values=[tf.reshape(v, [numel(v)]) for v in var_list])
+        self.sess = sess
+
+    def __call__(self):
+        if self.sess is None:
+            return tf.get_default_session().run(self.operation)
+        else:
+            return self.sess.run(self.operation)
+
+
 def get_target_updates(_vars, target_vars, tau, verbose=0):
     """Get target update operations.
 
@@ -743,8 +835,9 @@ def process_minibatch(mb_obs,
         mb_rewards[env_num] = np.asarray(mb_rewards[env_num])
         mb_actions[env_num] = np.concatenate(mb_actions[env_num], axis=0)
         mb_values[env_num] = np.concatenate(mb_values[env_num], axis=0)
-        mb_neglogpacs[env_num] = np.concatenate(
-            mb_neglogpacs[env_num], axis=0)
+        if mb_neglogpacs is not None:  # TRPO case
+            mb_neglogpacs[env_num] = np.concatenate(
+                mb_neglogpacs[env_num], axis=0)
         mb_dones[env_num] = np.asarray(mb_dones[env_num])
         n_steps += mb_obs[env_num].shape[0]
 
@@ -764,7 +857,8 @@ def process_minibatch(mb_obs,
         mb_contexts = np.concatenate(mb_contexts, axis=0)
         mb_actions = np.concatenate(mb_actions, axis=0)
         mb_values = np.concatenate(mb_values, axis=0)
-        mb_neglogpacs = np.concatenate(mb_neglogpacs, axis=0)
+        if mb_neglogpacs is not None:  # TRPO case
+            mb_neglogpacs = np.concatenate(mb_neglogpacs, axis=0)
         mb_all_obs = np.concatenate(mb_all_obs, axis=0)
         mb_returns = np.concatenate(mb_returns, axis=0)
     else:
@@ -772,7 +866,8 @@ def process_minibatch(mb_obs,
         mb_contexts = mb_contexts[0]
         mb_actions = mb_actions[0]
         mb_values = mb_values[0]
-        mb_neglogpacs = mb_neglogpacs[0]
+        if mb_neglogpacs is not None:  # TRPO case
+            mb_neglogpacs = mb_neglogpacs[0]
         mb_all_obs = mb_all_obs[0]
         mb_returns = mb_returns[0]
 
