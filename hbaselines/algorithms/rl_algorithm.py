@@ -670,17 +670,6 @@ class RLAlgorithm(object):
             tf.compat.v1.summary.scalar("Train/return_history",
                                         self.rew_history_ph)
 
-            # Add the info_dict various to tensorboard as well. TODO
-            # with tf.compat.v1.variable_scope("info_at_done"):
-            #     for key in self._info_keys:
-            #         self.info_ph[key] = tf.compat.v1.placeholder(
-            #             tf.float32, name="{}".format(key))
-            #         tf.compat.v1.summary.scalar(
-            #             "{}".format(key), self.info_ph[key])
-
-            # Create the tensorboard summary.
-            self.summary = tf.compat.v1.summary.merge_all()
-
             # Initialize the model parameters and optimizers.
             with self.sess.as_default():
                 self.sess.run(tf.compat.v1.global_variables_initializer())
@@ -941,6 +930,19 @@ class RLAlgorithm(object):
 
                 # Run and store summary.
                 if writer is not None:
+                    # Add the info keys to the summary in the first epoch.
+                    if self.epoch == 0:
+                        # Add the info_dict various to tensorboard as well.
+                        with tf.compat.v1.variable_scope("info_at_done"):
+                            for key in self.info_at_done.keys():
+                                self.info_ph[key] = tf.compat.v1.placeholder(
+                                    tf.float32, name="{}".format(key))
+                                tf.compat.v1.summary.scalar(
+                                    "{}".format(key), self.info_ph[key])
+
+                        # Create the tensorboard summary.
+                        self.summary = tf.compat.v1.summary.merge_all()
+
                     td_map = self.policy_tf.get_td_map()
 
                     # Check if td_map is empty.
