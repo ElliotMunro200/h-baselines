@@ -675,111 +675,8 @@ class TRPO(object):
 
 """TRPO-compatible feedforward policy."""
 
-from itertools import zip_longest
-
-
-def mlp_extractor(flat_observations, net_arch, act_fun):
-    latent = flat_observations
-    # Layer sizes of the network that only belongs to the policy network
-    policy_only_layers = []
-    # Layer sizes of the network that only belongs to the value network
-    value_only_layers = []
-
-    # Iterate through the shared layers and build the shared parts of the
-    # network
-    for idx, layer in enumerate(net_arch):
-        if isinstance(layer, int):  # Check that this is a shared layer
-            layer_size = layer
-            latent = act_fun(linear(
-                latent, "shared_fc{}".format(idx), layer_size,
-                init_scale=np.sqrt(2)))
-        else:
-            assert isinstance(layer, dict), \
-                "Error: the net_arch list can only contain ints and dicts"
-            if 'pi' in layer:
-                assert isinstance(layer['pi'], list), \
-                    "Error: net_arch[-1]['pi'] must contain a list of " \
-                    "integers."
-                policy_only_layers = layer['pi']
-
-            if 'vf' in layer:
-                assert isinstance(layer['vf'], list), \
-                    "Error: net_arch[-1]['vf'] must contain a list of " \
-                    "integers."
-                value_only_layers = layer['vf']
-            # From here on the network splits up in policy and value network
-            break
-
-    # Build the non-shared part of the network
-    latent_policy = latent
-    latent_value = latent
-    for idx, (pi_layer_size, vf_layer_size) in enumerate(
-            zip_longest(policy_only_layers, value_only_layers)):
-        if pi_layer_size is not None:
-            assert isinstance(pi_layer_size, int), \
-                "Error: net_arch[-1]['pi'] must only contain integers."
-            latent_policy = act_fun(linear(
-                latent_policy, "pi_fc{}".format(idx), pi_layer_size,
-                init_scale=np.sqrt(2)))
-
-        if vf_layer_size is not None:
-            assert isinstance(vf_layer_size, int), \
-                "Error: net_arch[-1]['vf'] must only contain integers."
-            latent_value = act_fun(linear(
-                latent_value, "vf_fc{}".format(idx), vf_layer_size,
-                init_scale=np.sqrt(2)))
-
-    return latent_policy, latent_value
-
-
-def ortho_init(scale=1.0):
-    """
-    Orthogonal initialization for the policy weights
-
-    :param scale: (float) Scaling factor for the weights.
-    :return: (function) an initialization function for the weights
-    """
-
-    def _ortho_init(shape, *_, **_kwargs):
-        """Intialize weights as Orthogonal matrix.
-
-        Orthogonal matrix initialization [1]_. For n-dimensional shapes where
-        n > 2, the n-1 trailing axes are flattened. For convolutional layers,
-        this corresponds to the fan-in, so this makes the initialization usable
-        for both dense and convolutional layers.
-
-        References
-        ----------
-        .. [1] Saxe, Andrew M., James L. McClelland, and Surya Ganguli.
-               "Exact solutions to the nonlinear dynamics of learning in deep
-               linear
-        """
-        # lasagne ortho init for tf
-        shape = tuple(shape)
-        if len(shape) == 2:
-            flat_shape = shape
-        elif len(shape) == 4:  # assumes NHWC
-            flat_shape = (np.prod(shape[:-1]), shape[-1])
-        else:
-            raise NotImplementedError
-        gaussian_noise = np.random.normal(0.0, 1.0, flat_shape)
-        u, _, v = np.linalg.svd(gaussian_noise, full_matrices=False)
-        # pick the one with the correct shape
-        weights = u if u.shape == flat_shape else v
-        weights = weights.reshape(shape)
-        return (scale * weights[:shape[0], :shape[1]]).astype(np.float32)
-
-    return _ortho_init
-
-
-def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
-    with tf.variable_scope(scope):
-        n_input = input_tensor.get_shape()[1].value
-        weight = tf.get_variable("w", [n_input, n_hidden],
-                                 initializer=ortho_init(init_scale))
-        bias = tf.get_variable("b", [n_hidden],
-                               initializer=tf.constant_initializer(init_bias))
-        return tf.matmul(input_tensor, weight) + bias
+from hbaselines.utils.tf_util import create_fcnet
+from hbaselines.utils.tf_util import create_conv
 
 
 class FeedForwardPolicy(object):
@@ -791,23 +688,48 @@ class FeedForwardPolicy(object):
     :param ob_space: (Gym Space) The observation space of the environment
     :param ac_space: (Gym Space) The action space of the environment
     :param reuse: (bool) If the policy is reusable or not
-    :param layers: ([int]) (deprecated, use net_arch instead) The size of the
-        Neural network for the policy (if None, default to [64, 64])
-    :param act_fun: (tf.func) the activation function to use in the neural
-        network.
     """
 
     def __init__(self,
                  sess,
                  ob_space,
                  ac_space,
-                 reuse=False,
-                 layers=None,
-                 act_fun=tf.tanh):
+                 reuse=False):
         self.sess = sess
         self.reuse = reuse
         self.ob_space = ob_space
         self.ac_space = ac_space
+
+        self.model_params = dict(
+            # the type of model to use. Must be one of {"fcnet", "conv"}.
+            model_type="fcnet",
+            # the size of the neural network for the policy
+            layers=[256, 256],
+            # enable layer normalisation
+            layer_norm=False,
+            # enable batch normalisation
+            batch_norm=False,
+            # enable dropout
+            dropout=False,
+            # the activation function to use in the neural network
+            act_fun=tf.nn.relu,
+            # channels of the proprioceptive state to be ignored
+            ignore_flat_channels=[],
+            # observation includes an image but should it be ignored
+            ignore_image=False,
+            # the height of the image in the observation
+            image_height=32,
+            # the width of the image in the observation
+            image_width=32,
+            # the number of channels of the image in the observation
+            image_channels=3,
+            # the channels of the neural network conv layers for the policy
+            filters=[16, 16, 16],
+            # the kernel size of the neural network conv layers for the policy
+            kernel_sizes=[5, 5, 5],
+            # the kernel size of the neural network conv layers for the policy
+            strides=[2, 2, 2],
+        )
 
         with tf.variable_scope("input", reuse=False):
             self.obs_ph = tf.placeholder(
@@ -816,38 +738,188 @@ class FeedForwardPolicy(object):
                 name="obs_ph")
             self.action_ph = None
 
-        if layers is None:
-            layers = [64, 64]
-        net_arch = [dict(vf=layers, pi=layers)]
+        # =================================================================== #
+        # Step 1: Create input variables.                                     #
+        # =================================================================== #
 
-        with tf.variable_scope("model", reuse=reuse):
-            pi_latent, vf_latent = mlp_extractor(
-                tf.layers.flatten(self.obs_ph), net_arch, act_fun)
+        with tf.compat.v1.variable_scope("input", reuse=False):
+            self.rew_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name='rewards')
+            self.action_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,) + ac_space.shape,
+                name='actions')
+            self.obs_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,) + ob_space.shape,
+                name='obs0')
+            self.advs_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name="advs_ph")
+            self.old_neglog_pac_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name="old_neglog_pac_ph")
+            self.old_vpred_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None,),
+                name="old_vpred_ph")
+            self.phase_ph = tf.compat.v1.placeholder(
+                tf.bool,
+                name='phase')
+            self.rate_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                name='rate')
 
-            self.value_fn = linear(vf_latent, 'vf', 1)
+        # =================================================================== #
+        # Step 2: Create actor and critic variables.                          #
+        # =================================================================== #
 
-            mean = linear(
-                pi_latent,
-                'pi',
-                ac_space.shape[0],
-                init_scale=0.01,
-                init_bias=0.0)
-            logstd = tf.get_variable(
-                name='pi/logstd',
-                shape=[1, ac_space.shape[0]],
-                initializer=tf.zeros_initializer())
+        # Create networks and core TF parts that are shared across setup parts.
+        with tf.variable_scope("model", reuse=False):
+            # Create the policy.
+            self.action, self.pi_mean, self.pi_logstd = self.make_actor(
+                self.obs_ph, scope="pi")
+            self.pi_std = tf.exp(self.pi_logstd)
 
-            self.policy = mean
-            self.mean = mean
-            self.logstd = logstd
-            self.std = tf.exp(logstd)
-
-        with tf.variable_scope("output", reuse=True):
-            self.action = self.sample()
-            self.deterministic_action = self.mean
+            # Create a method the log-probability of current actions.
             self.neglogp = self._neglogp(self.action)
-            self.policy_proba = [self.mean, self.std]
+
+            # Create the value function.
+            self.value_fn = self.make_critic(self.obs_ph, scope="vf")
             self.value_flat = self.value_fn[:, 0]
+
+    def make_actor(self, obs, reuse=False, scope="pi"):
+        """Create an actor tensor.
+
+        Parameters
+        ----------
+        obs : tf.compat.v1.placeholder
+            the input observation placeholder
+        reuse : bool
+            whether or not to reuse parameters
+        scope : str
+            the scope name of the actor
+
+        Returns
+        -------
+        tf.Variable
+            the output from the actor
+        """
+        # Initial image pre-processing (for convolutional policies).
+        if self.model_params["model_type"] == "conv":
+            pi_h = create_conv(
+                obs=obs,
+                image_height=self.model_params["image_height"],
+                image_width=self.model_params["image_width"],
+                image_channels=self.model_params["image_channels"],
+                ignore_flat_channels=self.model_params["ignore_flat_channels"],
+                ignore_image=self.model_params["ignore_image"],
+                filters=self.model_params["filters"],
+                kernel_sizes=self.model_params["kernel_sizes"],
+                strides=self.model_params["strides"],
+                act_fun=self.model_params["act_fun"],
+                layer_norm=self.model_params["layer_norm"],
+                batch_norm=self.model_params["batch_norm"],
+                phase=self.phase_ph,
+                dropout=self.model_params["dropout"],
+                rate=self.rate_ph,
+                scope=scope,
+                reuse=reuse,
+            )
+        else:
+            pi_h = obs
+
+        # Create the output mean.
+        policy_mean = create_fcnet(
+            obs=pi_h,
+            layers=self.model_params["layers"],
+            num_output=self.ac_space.shape[0],
+            stochastic=False,
+            act_fun=self.model_params["act_fun"],
+            layer_norm=self.model_params["layer_norm"],
+            batch_norm=self.model_params["batch_norm"],
+            phase=self.phase_ph,
+            dropout=self.model_params["dropout"],
+            rate=self.rate_ph,
+            scope=scope,
+            reuse=reuse,
+        )
+
+        # Create the output log_std.
+        log_std = tf.get_variable(
+            name='logstd',
+            shape=[1, self.ac_space.shape[0]],
+            initializer=tf.zeros_initializer()
+        )
+
+        # Create a method to sample from the distribution.
+        std = tf.exp(log_std)
+        action = policy_mean + std * tf.random_normal(
+            shape=tf.shape(policy_mean),
+            dtype=tf.float32
+        )
+
+        return action, policy_mean, log_std
+
+    def make_critic(self, obs, reuse=False, scope="qf"):
+        """Create a critic tensor.
+
+        Parameters
+        ----------
+        obs : tf.compat.v1.placeholder
+            the input observation placeholder
+        reuse : bool
+            whether or not to reuse parameters
+        scope : str
+            the scope name of the actor
+
+        Returns
+        -------
+        tf.Variable
+            the output from the critic
+        """
+        # Initial image pre-processing (for convolutional policies).
+        if self.model_params["model_type"] == "conv":
+            vf_h = create_conv(
+                obs=obs,
+                image_height=self.model_params["image_height"],
+                image_width=self.model_params["image_width"],
+                image_channels=self.model_params["image_channels"],
+                ignore_flat_channels=self.model_params["ignore_flat_channels"],
+                ignore_image=self.model_params["ignore_image"],
+                filters=self.model_params["filters"],
+                kernel_sizes=self.model_params["kernel_sizes"],
+                strides=self.model_params["strides"],
+                act_fun=self.model_params["act_fun"],
+                layer_norm=self.model_params["layer_norm"],
+                batch_norm=self.model_params["batch_norm"],
+                phase=self.phase_ph,
+                dropout=self.model_params["dropout"],
+                rate=self.rate_ph,
+                scope=scope,
+                reuse=reuse,
+            )
+        else:
+            vf_h = obs
+
+        return create_fcnet(
+            obs=vf_h,
+            layers=self.model_params["layers"],
+            num_output=1,
+            stochastic=False,
+            act_fun=self.model_params["act_fun"],
+            layer_norm=self.model_params["layer_norm"],
+            batch_norm=self.model_params["batch_norm"],
+            phase=self.phase_ph,
+            dropout=self.model_params["dropout"],
+            rate=self.rate_ph,
+            scope=scope,
+            reuse=reuse,
+        )
 
     def step(self, obs):
         action, value = self.sess.run(
@@ -859,20 +931,21 @@ class FeedForwardPolicy(object):
 
     def _neglogp(self, x):
         return 0.5 * tf.reduce_sum(
-            tf.square((x - self.mean) / self.std), axis=-1) + 0.5 * \
+            tf.square((x - self.pi_mean) / self.pi_std), axis=-1) + 0.5 * \
             np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
-            + tf.reduce_sum(self.logstd, axis=-1)
+            + tf.reduce_sum(self.pi_logstd, axis=-1)
 
     def kl(self, other):
         return tf.reduce_sum(
-            other.logstd - self.logstd +
-            (tf.square(self.std) + tf.square(self.mean - other.mean)) /
-            (2.0 * tf.square(other.std)) - 0.5, axis=-1)
+            other.pi_logstd - self.pi_logstd + (
+                tf.square(self.pi_std) +
+                tf.square(self.pi_mean - other.pi_mean))
+            / (2.0 * tf.square(other.pi_std)) - 0.5, axis=-1)
 
     def entropy(self):
         return tf.reduce_sum(
-            self.logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
+            self.pi_logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
 
     def sample(self):
-        return self.mean + self.std * tf.random_normal(
-            tf.shape(self.mean), dtype=self.mean.dtype)
+        return self.pi_mean + self.pi_std * tf.random_normal(
+            tf.shape(self.pi_mean), dtype=self.pi_mean.dtype)
