@@ -98,7 +98,7 @@ class FlowEnv(gym.Env):
         if isinstance(done, dict):
             done = {key: done[key] or self.step_number == self.horizon
                     for key in obs.keys()}
-            done["__all__"] = self.step_number == self.horizon
+            done["__all__"] = all(done.values())
         else:
             done = done or self.step_number == self.horizon
 
