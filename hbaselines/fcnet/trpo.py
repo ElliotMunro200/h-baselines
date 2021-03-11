@@ -181,19 +181,6 @@ def add_vtarg_and_adv(seg, gamma, lam):
     seg["tdlamret"] = seg["adv"] + seg["vpred"]
 
 
-def zipsame(*seqs):
-    """
-    Performs a zip function, but asserts that all zipped elements are of the
-    same size
-
-    :param seqs: a list of arrays that are zipped together
-    :return: the zipped arguments
-    """
-    length = len(seqs[0])
-    assert all(len(seq) == length for seq in seqs[1:])
-    return zip(*seqs)
-
-
 def conjugate_gradient(f_ax,
                        b_vec,
                        cg_iters=10,
@@ -366,21 +353,81 @@ class TRPO(object):
 
             # Construct network for new policy
             self.policy_tf = self.policy(
-                self.sess,
-                self.observation_space,
-                self.action_space,
-                reuse=False,
-                **self.policy_kwargs,
+                sess=self.sess,
+                ob_space=self.observation_space,
+                ac_space=self.action_space,
+                co_space=None,
+                verbose=self.verbose,
+                learning_rate=1e-3,
+                model_params=dict(
+                    model_type="fcnet",
+                    layers=[256, 256],
+                    layer_norm=False,
+                    batch_norm=False,
+                    dropout=False,
+                    act_fun=tf.nn.relu,
+                    ignore_flat_channels=[],
+                    ignore_image=False,
+                    image_height=32,
+                    image_width=32,
+                    image_channels=3,
+                    filters=[16, 16, 16],
+                    kernel_sizes=[5, 5, 5],
+                    strides=[2, 2, 2],
+                ),
+                n_minibatches=1e-3,
+                n_opt_epochs=1e-3,
+                gamma=1e-3,
+                lam=1e-3,
+                ent_coef=1e-3,
+                vf_coef=1e-3,
+                max_grad_norm=1e-3,
+                cliprange=1e-3,
+                cliprange_vf=1e-3,
+                l2_penalty=1e-3,
+                scope=None,
+                num_envs=1,
             )
+            print("policy_tf", self.policy_tf)
+            print("policy_tf", self.policy_tf.entropy)
 
             # Network for old policy
             with tf.variable_scope("oldpi", reuse=False):
                 self.old_policy = self.policy(
-                    self.sess,
-                    self.observation_space,
-                    self.action_space,
-                    reuse=False,
-                    **self.policy_kwargs,
+                    sess=self.sess,
+                    ob_space=self.observation_space,
+                    ac_space=self.action_space,
+                    co_space=None,
+                    verbose=self.verbose,
+                    learning_rate=1e-3,
+                    model_params=dict(
+                        model_type="fcnet",
+                        layers=[256, 256],
+                        layer_norm=False,
+                        batch_norm=False,
+                        dropout=False,
+                        act_fun=tf.nn.relu,
+                        ignore_flat_channels=[],
+                        ignore_image=False,
+                        image_height=32,
+                        image_width=32,
+                        image_channels=3,
+                        filters=[16, 16, 16],
+                        kernel_sizes=[5, 5, 5],
+                        strides=[2, 2, 2],
+                    ),
+                    n_minibatches=1e-3,
+                    n_opt_epochs=1e-3,
+                    gamma=1e-3,
+                    lam=1e-3,
+                    ent_coef=1e-3,
+                    vf_coef=1e-3,
+                    max_grad_norm=1e-3,
+                    cliprange=1e-3,
+                    cliprange_vf=1e-3,
+                    l2_penalty=1e-3,
+                    scope=None,
+                    num_envs=1,
                 )
 
             with tf.variable_scope("loss", reuse=False):
@@ -388,12 +435,6 @@ class TRPO(object):
                 self.atarg = tf.placeholder(dtype=tf.float32, shape=[None])
                 # Empirical return
                 self.ret = tf.placeholder(dtype=tf.float32, shape=[None])
-
-                observation = self.policy_tf.obs_ph
-                self.action = tf.placeholder(
-                    dtype=tf.float32,
-                    shape=[None, self.action_space.shape[0]],
-                    name="action_ph")
 
                 kloldnew = self.old_policy.kl(self.policy_tf)
                 ent = self.policy_tf.entropy()
@@ -406,8 +447,8 @@ class TRPO(object):
 
                 # advantage * pnew / pold
                 ratio = tf.exp(
-                    self.policy_tf.logp(self.action) -
-                    self.old_policy.logp(self.action))
+                    self.policy_tf.logp(self.policy_tf.action_ph) -
+                    self.old_policy.logp(self.policy_tf.action_ph))
                 surrgain = tf.reduce_mean(ratio * self.atarg)
 
                 optimgain = surrgain + entbonus
@@ -442,7 +483,7 @@ class TRPO(object):
                     start += var_size
                 gvp = tf.add_n(
                     [tf.reduce_sum(grad * tangent)
-                     for (grad, tangent) in zipsame(klgrads, tangents)])
+                     for (grad, tangent) in zip(klgrads, tangents)])
                 # Fisher vector products
                 fvp = tf_util.flatgrad(gvp, var_list)
 
@@ -450,12 +491,17 @@ class TRPO(object):
                     [],
                     [],
                     updates=[tf.assign(oldv, newv) for (oldv, newv) in
-                             zipsame(get_globals_vars("oldpi"),
-                                     get_globals_vars("model"))],
+                             zip(get_globals_vars("oldpi"),
+                                 get_globals_vars("model"))],
                 )
                 self.compute_fvp = tf_util.function(
-                    [flat_tangent, observation, self.old_policy.obs_ph,
-                     self.action, self.atarg], fvp)
+                    [flat_tangent,
+                     self.policy_tf.obs_ph,
+                     self.old_policy.obs_ph,
+                     self.policy_tf.action_ph,
+                     self.atarg],
+                    fvp,
+                )
                 self.vf_grad = tf_util.flatgrad(vferr, vf_var_list)
 
                 tf_util.initialize(sess=self.sess)
@@ -541,7 +587,7 @@ class TRPO(object):
             feed_dict={
                 self.policy_tf.obs_ph: seg["observations"],
                 self.old_policy.obs_ph: seg["observations"],
-                self.action: seg["actions"],
+                self.policy_tf.action_ph: seg["actions"],
                 self.atarg: atarg,
                 self.ret: tdlamret,
             }
@@ -574,7 +620,7 @@ class TRPO(object):
                     feed_dict={
                         self.policy_tf.obs_ph: seg["observations"],
                         self.old_policy.obs_ph: seg["observations"],
-                        self.action: seg["actions"],
+                        self.policy_tf.action_ph: seg["actions"],
                         self.atarg: atarg,
                     }
                 )
@@ -607,7 +653,7 @@ class TRPO(object):
                     feed_dict={
                         self.policy_tf.obs_ph: mbob,
                         self.old_policy.obs_ph: mbob,
-                        self.action: seg["actions"],
+                        self.policy_tf.action_ph: seg["actions"],
                         self.ret: mbret,
                     }
                 )
@@ -675,68 +721,118 @@ class TRPO(object):
 
 """TRPO-compatible feedforward policy."""
 
+from hbaselines.base_policies import Policy
 from hbaselines.utils.tf_util import create_fcnet
 from hbaselines.utils.tf_util import create_conv
 
 
-class FeedForwardPolicy(object):
-    """
-    Policy object that implements actor critic, using a feed forward neural
-    network.
-
-    :param sess: (TensorFlow session) The current TensorFlow session
-    :param ob_space: (Gym Space) The observation space of the environment
-    :param ac_space: (Gym Space) The action space of the environment
-    :param reuse: (bool) If the policy is reusable or not
-    """
+class FeedForwardPolicy(Policy):
 
     def __init__(self,
                  sess,
                  ob_space,
                  ac_space,
-                 reuse=False):
-        self.sess = sess
-        self.reuse = reuse
-        self.ob_space = ob_space
-        self.ac_space = ac_space
+                 co_space,
+                 verbose,
+                 learning_rate,
+                 model_params,
+                 n_minibatches,
+                 n_opt_epochs,
+                 gamma,
+                 lam,
+                 ent_coef,
+                 vf_coef,
+                 max_grad_norm,
+                 cliprange,
+                 cliprange_vf,
+                 l2_penalty,
+                 scope=None,
+                 num_envs=1):
+        """Instantiate the policy object.
 
-        self.model_params = dict(
-            # the type of model to use. Must be one of {"fcnet", "conv"}.
-            model_type="fcnet",
-            # the size of the neural network for the policy
-            layers=[256, 256],
-            # enable layer normalisation
-            layer_norm=False,
-            # enable batch normalisation
-            batch_norm=False,
-            # enable dropout
-            dropout=False,
-            # the activation function to use in the neural network
-            act_fun=tf.nn.relu,
-            # channels of the proprioceptive state to be ignored
-            ignore_flat_channels=[],
-            # observation includes an image but should it be ignored
-            ignore_image=False,
-            # the height of the image in the observation
-            image_height=32,
-            # the width of the image in the observation
-            image_width=32,
-            # the number of channels of the image in the observation
-            image_channels=3,
-            # the channels of the neural network conv layers for the policy
-            filters=[16, 16, 16],
-            # the kernel size of the neural network conv layers for the policy
-            kernel_sizes=[5, 5, 5],
-            # the kernel size of the neural network conv layers for the policy
-            strides=[2, 2, 2],
+        Parameters
+        ----------
+        sess : tf.compat.v1.Session
+            the current TensorFlow session
+        ob_space : gym.spaces.*
+            the observation space of the environment
+        ac_space : gym.spaces.*
+            the action space of the environment
+        co_space : gym.spaces.*
+            the context space of the environment
+        verbose : int
+            the verbosity level: 0 none, 1 training information, 2 tensorflow
+            debug
+        l2_penalty : float
+            L2 regularization penalty. This is applied to the policy network.
+        model_params : dict
+            dictionary of model-specific parameters. See parent class.
+        learning_rate : float
+            the learning rate
+        n_minibatches : int
+            number of training minibatches per update
+        n_opt_epochs : int
+            number of training epochs per update procedure
+        gamma : float
+            the discount factor
+        lam : float
+            factor for trade-off of bias vs variance for Generalized Advantage
+            Estimator
+        ent_coef : float
+            entropy coefficient for the loss calculation
+        vf_coef : float
+            value function coefficient for the loss calculation
+        max_grad_norm : float
+            the maximum value for the gradient clipping
+        cliprange : float or callable
+            clipping parameter, it can be a function
+        cliprange_vf : float or callable
+            clipping parameter for the value function, it can be a function.
+            This is a parameter specific to the OpenAI implementation. If None
+            is passed (default), then `cliprange` (that is used for the policy)
+            will be used. IMPORTANT: this clipping depends on the reward
+            scaling. To deactivate value function clipping (and recover the
+            original PPO implementation), you have to pass a negative value
+            (e.g. -1).
+        """
+        super(FeedForwardPolicy, self).__init__(
+            sess=sess,
+            ob_space=ob_space,
+            ac_space=ac_space,
+            co_space=co_space,
+            verbose=verbose,
+            l2_penalty=l2_penalty,
+            model_params=model_params,
+            num_envs=num_envs,
         )
 
-        with tf.variable_scope("input", reuse=False):
-            self.obs_ph = tf.placeholder(
-                shape=(None,) + ob_space.shape,
-                dtype=tf.float32,
-                name="obs_ph")
-            self.action_ph = None
+        self.learning_rate = learning_rate
+        self.n_minibatches = n_minibatches
+        self.n_opt_epochs = n_opt_epochs
+        self.gamma = gamma
+        self.lam = lam
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.max_grad_norm = max_grad_norm
+        self.cliprange = cliprange
+        self.cliprange_vf = cliprange_vf
+
+        # Create variables to store on-policy data.
+        self.mb_rewards = [[] for _ in range(num_envs)]
+        self.mb_obs = [[] for _ in range(num_envs)]
+        self.mb_contexts = [[] for _ in range(num_envs)]
+        self.mb_actions = [[] for _ in range(num_envs)]
+        self.mb_values = [[] for _ in range(num_envs)]
+        self.mb_neglogpacs = [[] for _ in range(num_envs)]
+        self.mb_dones = [[] for _ in range(num_envs)]
+        self.mb_all_obs = [[] for _ in range(num_envs)]
+        self.mb_returns = [[] for _ in range(num_envs)]
+        self.last_obs = [None for _ in range(num_envs)]
+        self.mb_advs = None
+
+        # Compute the shape of the input observation space, which may include
+        # the contextual term.
+        ob_dim = self._get_ob_dim(ob_space, co_space)
 
         # =================================================================== #
         # Step 1: Create input variables.                                     #
@@ -753,7 +849,7 @@ class FeedForwardPolicy(object):
                 name='actions')
             self.obs_ph = tf.compat.v1.placeholder(
                 tf.float32,
-                shape=(None,) + ob_space.shape,
+                shape=(None,) + ob_dim,
                 name='obs0')
             self.advs_ph = tf.compat.v1.placeholder(
                 tf.float32,
@@ -791,6 +887,19 @@ class FeedForwardPolicy(object):
             # Create the value function.
             self.value_fn = self.make_critic(self.obs_ph, scope="vf")
             self.value_flat = self.value_fn[:, 0]
+
+        # =================================================================== #
+        # Step 3: Setup the optimizers for the actor and critic.              #
+        # =================================================================== #
+
+        with tf.compat.v1.variable_scope("Optimizer", reuse=False):
+            self._setup_optimizers(scope)
+
+        # =================================================================== #
+        # Step 4: Setup the operations for computing model statistics.        #
+        # =================================================================== #
+
+        self._setup_stats(scope or "Model")
 
     def make_actor(self, obs, reuse=False, scope="pi"):
         """Create an actor tensor.
@@ -920,6 +1029,22 @@ class FeedForwardPolicy(object):
             scope=scope,
             reuse=reuse,
         )
+
+    def _setup_optimizers(self, scope):
+        """Create the actor and critic optimizers."""
+        pass  # TODO
+
+    def _setup_stats(self, base):
+        """Create the running means and std of the model inputs and outputs.
+
+        This method also adds the same running means and stds as scalars to
+        tensorboard for additional storage.
+        """
+        pass  # TODO
+
+    def initialize(self):
+        """See parent class."""
+        pass
 
     def step(self, obs):
         action, value = self.sess.run(
