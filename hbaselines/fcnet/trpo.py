@@ -305,7 +305,6 @@ class TRPO(object):
         self.vf_iters = vf_iters
         self.vf_stepsize = vf_stepsize
         self.entcoeff = entcoeff
-        self.loss_names = None
         self.assign_old_eq_new = None
         self.compute_fvp = None
         self.vfadam = None
@@ -391,70 +390,21 @@ class TRPO(object):
             print("policy_tf", self.policy_tf)
             print("policy_tf", self.policy_tf.entropy)
 
-            # Network for old policy
-            with tf.variable_scope("oldpi", reuse=False):
-                self.old_policy = self.policy(
-                    sess=self.sess,
-                    ob_space=self.observation_space,
-                    ac_space=self.action_space,
-                    co_space=None,
-                    verbose=self.verbose,
-                    learning_rate=1e-3,
-                    model_params=dict(
-                        model_type="fcnet",
-                        layers=[256, 256],
-                        layer_norm=False,
-                        batch_norm=False,
-                        dropout=False,
-                        act_fun=tf.nn.relu,
-                        ignore_flat_channels=[],
-                        ignore_image=False,
-                        image_height=32,
-                        image_width=32,
-                        image_channels=3,
-                        filters=[16, 16, 16],
-                        kernel_sizes=[5, 5, 5],
-                        strides=[2, 2, 2],
-                    ),
-                    n_minibatches=1e-3,
-                    n_opt_epochs=1e-3,
-                    gamma=1e-3,
-                    lam=1e-3,
-                    ent_coef=1e-3,
-                    vf_coef=1e-3,
-                    max_grad_norm=1e-3,
-                    cliprange=1e-3,
-                    cliprange_vf=1e-3,
-                    l2_penalty=1e-3,
-                    scope=None,
-                    num_envs=1,
-                )
-
             with tf.variable_scope("loss", reuse=False):
-                # Target advantage function (if applicable)
-                self.atarg = tf.placeholder(dtype=tf.float32, shape=[None])
-                # Empirical return
-                self.ret = tf.placeholder(dtype=tf.float32, shape=[None])
-
-                kloldnew = self.old_policy.kl(self.policy_tf)
+                kloldnew = self.policy_tf.kl()
                 ent = self.policy_tf.entropy()
                 meankl = tf.reduce_mean(kloldnew)
                 meanent = tf.reduce_mean(ent)
                 entbonus = self.entcoeff * meanent
 
-                vferr = tf.reduce_mean(
-                    tf.square(self.policy_tf.value_flat - self.ret))
-
                 # advantage * pnew / pold
                 ratio = tf.exp(
-                    self.policy_tf.logp(self.policy_tf.action_ph) -
-                    self.old_policy.logp(self.policy_tf.action_ph))
-                surrgain = tf.reduce_mean(ratio * self.atarg)
+                    self.policy_tf.logp(self.policy_tf.action_ph, old=False) -
+                    self.policy_tf.logp(self.policy_tf.action_ph, old=True))
+                surrgain = tf.reduce_mean(ratio * self.policy_tf.advs_ph)
 
                 optimgain = surrgain + entbonus
                 self.losses = [optimgain, meankl, entbonus, surrgain, meanent]
-                self.loss_names = ["optimgain", "meankl", "entloss",
-                                   "surrgain", "entropy"]
 
                 all_var_list = get_trainable_vars("model")
                 var_list = [
@@ -497,11 +447,12 @@ class TRPO(object):
                 self.compute_fvp = tf_util.function(
                     [flat_tangent,
                      self.policy_tf.obs_ph,
-                     self.old_policy.obs_ph,
                      self.policy_tf.action_ph,
-                     self.atarg],
+                     self.policy_tf.advs_ph],
                     fvp,
                 )
+                vferr = tf.reduce_mean(tf.square(
+                    self.policy_tf.value_flat - self.policy_tf.ret_ph))
                 self.vf_grad = tf_util.flatgrad(vferr, vf_var_list)
 
                 tf_util.initialize(sess=self.sess)
@@ -573,7 +524,7 @@ class TRPO(object):
         # standardized advantage function estimate
         atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
 
-        args = seg["observations"], seg["observations"], seg["actions"], atarg
+        args = seg["observations"], seg["actions"], atarg
         # Subsampling: see p40-42 of John Schulman thesis
         # http://joschu.net/docs/thesis.pdf
         fvpargs = [arr[::5] for arr in args]
@@ -586,10 +537,9 @@ class TRPO(object):
             [self.grad] + self.losses,
             feed_dict={
                 self.policy_tf.obs_ph: seg["observations"],
-                self.old_policy.obs_ph: seg["observations"],
                 self.policy_tf.action_ph: seg["actions"],
-                self.atarg: atarg,
-                self.ret: tdlamret,
+                self.policy_tf.advs_ph: atarg,
+                self.policy_tf.ret_ph: tdlamret,
             }
         )
 
@@ -619,9 +569,8 @@ class TRPO(object):
                     self.losses,
                     feed_dict={
                         self.policy_tf.obs_ph: seg["observations"],
-                        self.old_policy.obs_ph: seg["observations"],
                         self.policy_tf.action_ph: seg["actions"],
-                        self.atarg: atarg,
+                        self.policy_tf.advs_ph: atarg,
                     }
                 )
                 improve = surr - surrbefore
@@ -652,9 +601,8 @@ class TRPO(object):
                     self.vf_grad,
                     feed_dict={
                         self.policy_tf.obs_ph: mbob,
-                        self.old_policy.obs_ph: mbob,
                         self.policy_tf.action_ph: seg["actions"],
-                        self.ret: mbret,
+                        self.policy_tf.ret_ph: mbret,
                     }
                 )
                 self.vfadam.update(grad, self.vf_stepsize)
@@ -851,6 +799,10 @@ class FeedForwardPolicy(Policy):
                 tf.float32,
                 shape=(None,) + ob_dim,
                 name='obs0')
+            self.ret_ph = tf.placeholder(
+                dtype=tf.float32,
+                shape=(None,),
+                name="ret_ph")
             self.advs_ph = tf.compat.v1.placeholder(
                 tf.float32,
                 shape=(None,),
@@ -887,6 +839,20 @@ class FeedForwardPolicy(Policy):
             # Create the value function.
             self.value_fn = self.make_critic(self.obs_ph, scope="vf")
             self.value_flat = self.value_fn[:, 0]
+
+        # Network for old policy
+        with tf.variable_scope("oldpi/model", reuse=False):
+            # Create the policy.
+            self.old_action, self.old_pi_mean, self.old_pi_logstd = \
+                self.make_actor(self.obs_ph, scope="pi")
+            self.old_pi_std = tf.exp(self.old_pi_logstd)
+
+            # Create a method the log-probability of current actions.
+            self.old_neglogp = self._neglogp(self.old_action)
+
+            # Create the value function.
+            self.old_value_fn = self.make_critic(self.obs_ph, scope="vf")
+            self.old_value_flat = self.old_value_fn[:, 0]
 
         # =================================================================== #
         # Step 3: Setup the optimizers for the actor and critic.              #
@@ -1051,8 +1017,11 @@ class FeedForwardPolicy(Policy):
             [self.action, self.value_flat], feed_dict={self.obs_ph: obs})
         return action, value
 
-    def logp(self, x):
-        return - self._neglogp(x)
+    def logp(self, x, old=False):
+        if old:
+            return - self._old_neglogp(x)
+        else:
+            return - self._neglogp(x)
 
     def _neglogp(self, x):
         return 0.5 * tf.reduce_sum(
@@ -1060,12 +1029,18 @@ class FeedForwardPolicy(Policy):
             np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
             + tf.reduce_sum(self.pi_logstd, axis=-1)
 
-    def kl(self, other):
+    def _old_neglogp(self, x):
+        return 0.5 * tf.reduce_sum(
+            tf.square((x - self.old_pi_mean) / self.old_pi_std), axis=-1) + 0.5 * \
+            np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
+            + tf.reduce_sum(self.old_pi_logstd, axis=-1)
+
+    def kl(self):
         return tf.reduce_sum(
-            other.pi_logstd - self.pi_logstd + (
-                tf.square(self.pi_std) +
-                tf.square(self.pi_mean - other.pi_mean))
-            / (2.0 * tf.square(other.pi_std)) - 0.5, axis=-1)
+            self.pi_logstd - self.old_pi_logstd + (
+                tf.square(self.old_pi_std) +
+                tf.square(self.old_pi_mean - self.pi_mean))
+            / (2.0 * tf.square(self.pi_std)) - 0.5, axis=-1)
 
     def entropy(self):
         return tf.reduce_sum(
