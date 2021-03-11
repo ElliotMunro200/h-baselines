@@ -395,9 +395,8 @@ class TRPO(object):
                     shape=[None, self.action_space.shape[0]],
                     name="action_ph")
 
-                kloldnew = self.old_policy.proba_distribution.kl(
-                    self.policy_tf.proba_distribution)
-                ent = self.policy_tf.proba_distribution.entropy()
+                kloldnew = self.old_policy.kl(self.policy_tf)
+                ent = self.policy_tf.entropy()
                 meankl = tf.reduce_mean(kloldnew)
                 meanent = tf.reduce_mean(ent)
                 entbonus = self.entcoeff * meanent
@@ -407,8 +406,8 @@ class TRPO(object):
 
                 # advantage * pnew / pold
                 ratio = tf.exp(
-                    self.policy_tf.proba_distribution.logp(self.action) -
-                    self.old_policy.proba_distribution.logp(self.action))
+                    self.policy_tf.logp(self.action) -
+                    self.old_policy.logp(self.action))
                 surrgain = tf.reduce_mean(ratio * self.atarg)
 
                 optimgain = surrgain + entbonus
@@ -741,7 +740,6 @@ def ortho_init(scale=1.0):
     :return: (function) an initialization function for the weights
     """
 
-    # _ortho_init(shape, dtype, partition_info=None)
     def _ortho_init(shape, *_, **_kwargs):
         """Intialize weights as Orthogonal matrix.
 
@@ -784,66 +782,6 @@ def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
         return tf.matmul(input_tensor, weight) + bias
 
 
-class DiagGaussianProbabilityDistribution(object):
-
-    def __init__(self, mean, logstd):
-        self.mean = mean
-        self.logstd = logstd
-        self.std = tf.exp(logstd)
-        super(DiagGaussianProbabilityDistribution, self).__init__()
-
-    def logp(self, x):
-        return - self.neglogp(x)
-
-    def neglogp(self, x):
-        return 0.5 * tf.reduce_sum(
-            tf.square((x - self.mean) / self.std), axis=-1) + 0.5 * \
-            np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
-            + tf.reduce_sum(self.logstd, axis=-1)
-
-    def kl(self, other):
-        assert isinstance(other, DiagGaussianProbabilityDistribution)
-        return tf.reduce_sum(
-            other.logstd - self.logstd +
-            (tf.square(self.std) + tf.square(self.mean - other.mean)) /
-            (2.0 * tf.square(other.std)) - 0.5, axis=-1)
-
-    def entropy(self):
-        return tf.reduce_sum(
-            self.logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
-
-    def sample(self):
-        return self.mean + self.std * tf.random_normal(
-            tf.shape(self.mean), dtype=self.mean.dtype)
-
-
-class DiagGaussianProbabilityDistributionType(object):
-
-    def __init__(self, size):
-        self.size = size
-
-    def proba_distribution_from_latent(self,
-                                       pi_latent_vector,
-                                       vf_latent_vector,
-                                       init_scale=1.0,
-                                       init_bias=0.0):
-        mean = linear(
-            pi_latent_vector,
-            'pi',
-            self.size,
-            init_scale=init_scale,
-            init_bias=init_bias)
-        logstd = tf.get_variable(
-            name='pi/logstd',
-            shape=[1, self.size],
-            initializer=tf.zeros_initializer())
-        q_values = linear(
-            vf_latent_vector, 'q', self.size,
-            init_scale=init_scale, init_bias=init_bias)
-        return DiagGaussianProbabilityDistribution(
-            mean, mean * 0.0 + logstd), mean, q_values
-
-
 class FeedForwardPolicy(object):
     """
     Policy object that implements actor critic, using a feed forward neural
@@ -870,8 +808,6 @@ class FeedForwardPolicy(object):
         self.reuse = reuse
         self.ob_space = ob_space
         self.ac_space = ac_space
-        self.pdtype = DiagGaussianProbabilityDistributionType(
-            ac_space.shape[0])
 
         with tf.variable_scope("input", reuse=False):
             self.obs_ph = tf.placeholder(
@@ -890,21 +826,53 @@ class FeedForwardPolicy(object):
 
             self.value_fn = linear(vf_latent, 'vf', 1)
 
-            self.proba_distribution, self.policy, _ = \
-                self.pdtype.proba_distribution_from_latent(
-                    pi_latent, vf_latent, init_scale=0.01)
+            mean = linear(
+                pi_latent,
+                'pi',
+                ac_space.shape[0],
+                init_scale=0.01,
+                init_bias=0.0)
+            logstd = tf.get_variable(
+                name='pi/logstd',
+                shape=[1, ac_space.shape[0]],
+                initializer=tf.zeros_initializer())
+
+            self.policy = mean
+            self.mean = mean
+            self.logstd = logstd
+            self.std = tf.exp(logstd)
 
         with tf.variable_scope("output", reuse=True):
-            assert self.policy is not None and self.proba_distribution \
-                is not None and self.value_fn is not None
-            self.action = self.proba_distribution.sample()
-            self.deterministic_action = self.proba_distribution.mean
-            self.neglogp = self.proba_distribution.neglogp(self.action)
-            self.policy_proba = [self.proba_distribution.mean,
-                                 self.proba_distribution.std]
+            self.action = self.sample()
+            self.deterministic_action = self.mean
+            self.neglogp = self._neglogp(self.action)
+            self.policy_proba = [self.mean, self.std]
             self.value_flat = self.value_fn[:, 0]
 
     def step(self, obs):
         action, value = self.sess.run(
             [self.action, self.value_flat], feed_dict={self.obs_ph: obs})
         return action, value
+
+    def logp(self, x):
+        return - self._neglogp(x)
+
+    def _neglogp(self, x):
+        return 0.5 * tf.reduce_sum(
+            tf.square((x - self.mean) / self.std), axis=-1) + 0.5 * \
+            np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
+            + tf.reduce_sum(self.logstd, axis=-1)
+
+    def kl(self, other):
+        return tf.reduce_sum(
+            other.logstd - self.logstd +
+            (tf.square(self.std) + tf.square(self.mean - other.mean)) /
+            (2.0 * tf.square(other.std)) - 0.5, axis=-1)
+
+    def entropy(self):
+        return tf.reduce_sum(
+            self.logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
+
+    def sample(self):
+        return self.mean + self.std * tf.random_normal(
+            tf.shape(self.mean), dtype=self.mean.dtype)
