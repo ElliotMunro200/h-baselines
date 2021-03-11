@@ -12,7 +12,6 @@ from hbaselines.utils.tf_util import get_globals_vars
 from hbaselines.utils.tf_util import get_trainable_vars
 
 import stable_baselines.common.tf_util as tf_util
-from stable_baselines.common.mpi_adam import MpiAdam
 
 
 def iterbatches(arrays,
@@ -306,8 +305,6 @@ class TRPO(object):
         self.vf_stepsize = vf_stepsize
         self.entcoeff = entcoeff
         self.assign_old_eq_new = None
-        self.compute_fvp = None
-        self.vfadam = None
         self.get_flat = None
         self.set_from_flat = None
 
@@ -387,8 +384,6 @@ class TRPO(object):
                 scope=None,
                 num_envs=1,
             )
-            print("policy_tf", self.policy_tf)
-            print("policy_tf", self.policy_tf.entropy)
 
             with tf.variable_scope("loss", reuse=False):
                 kloldnew = self.policy_tf.kl()
@@ -419,50 +414,41 @@ class TRPO(object):
                     var_list, sess=self.sess)
 
                 klgrads = tf.gradients(meankl, var_list)
-                flat_tangent = tf.placeholder(
-                    dtype=tf.float32,
-                    shape=[None],
-                    name="flat_tan")
                 shapes = [var.get_shape().as_list() for var in var_list]
                 start = 0
                 tangents = []
                 for shape in shapes:
                     var_size = tf_util.intprod(shape)
                     tangents.append(tf.reshape(
-                        flat_tangent[start: start + var_size], shape))
+                        self.policy_tf.flat_tangent[start: start + var_size],
+                        shape))
                     start += var_size
                 gvp = tf.add_n(
                     [tf.reduce_sum(grad * tangent)
                      for (grad, tangent) in zip(klgrads, tangents)])
                 # Fisher vector products
-                fvp = tf_util.flatgrad(gvp, var_list)
+                self.fvp = tf_util.flatgrad(gvp, var_list)
 
-                self.assign_old_eq_new = tf_util.function(
-                    [],
-                    [],
-                    updates=[tf.assign(oldv, newv) for (oldv, newv) in
-                             zip(get_globals_vars("oldpi"),
-                                 get_globals_vars("model"))],
-                )
-                self.compute_fvp = tf_util.function(
-                    [flat_tangent,
-                     self.policy_tf.obs_ph,
-                     self.policy_tf.action_ph,
-                     self.policy_tf.advs_ph],
-                    fvp,
-                )
+                self.assign_old_eq_new = tf.group(*[
+                    tf.assign(oldv, newv) for (oldv, newv) in
+                    zip(get_globals_vars("oldpi"), get_globals_vars("model"))])
+
+                # Create the value function optimizer.
                 vferr = tf.reduce_mean(tf.square(
                     self.policy_tf.value_flat - self.policy_tf.ret_ph))
-                self.vf_grad = tf_util.flatgrad(vferr, vf_var_list)
+                optimizer = tf.compat.v1.train.AdamOptimizer(self.vf_stepsize)
+                self.vf_optimizer = optimizer.minimize(
+                    vferr,
+                    var_list=vf_var_list,
+                )
 
-                tf_util.initialize(sess=self.sess)
+                # Initialize the model parameters and optimizers.
+                with self.sess.as_default():
+                    self.sess.run(tf.compat.v1.global_variables_initializer())
+                    self.policy_tf.initialize()
 
                 th_init = self.get_flat()
                 self.set_from_flat(th_init)
-
-            with tf.variable_scope("Adam_mpi", reuse=False):
-                self.vfadam = MpiAdam(vf_var_list, sess=self.sess)
-                self.vfadam.sync()
 
             self.grad = tf_util.flatgrad(optimgain, var_list)
 
@@ -511,16 +497,16 @@ class TRPO(object):
     def _train(self, seg):
 
         def fisher_vector_product(vec):
-            return self.compute_fvp(
-                vec, *fvpargs, sess=self.sess) + self.cg_damping * vec
-
-        mean_losses = None
+            return self.sess.run(self.fvp, feed_dict={
+                self.policy_tf.flat_tangent: vec,
+                self.policy_tf.obs_ph: fvpargs[0],
+                self.policy_tf.action_ph: fvpargs[1],
+                self.policy_tf.advs_ph: fvpargs[2],
+            }) + self.cg_damping * vec
 
         add_vtarg_and_adv(seg, self.gamma, self.lam)
         atarg, tdlamret = seg["adv"], seg["tdlamret"]
 
-        # predicted value function before update
-        vpredbefore = seg["vpred"]
         # standardized advantage function estimate
         atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
 
@@ -529,7 +515,7 @@ class TRPO(object):
         # http://joschu.net/docs/thesis.pdf
         fvpargs = [arr[::5] for arr in args]
 
-        self.assign_old_eq_new(sess=self.sess)
+        self.sess.run(self.assign_old_eq_new)
 
         # run loss backprop with summary, and save the metadata (memory,
         # compute time, ...)
@@ -591,23 +577,16 @@ class TRPO(object):
                 self.set_from_flat(thbefore)
 
         for _ in range(self.vf_iters):
-            # NOTE: for recurrent policies, use shuffle=False?
             for (mbob, mbret) in iterbatches(
                     (seg["observations"], seg["tdlamret"]),
                     include_final_partial_batch=False,
                     batch_size=128,
                     shuffle=True):
-                grad = self.sess.run(
-                    self.vf_grad,
-                    feed_dict={
-                        self.policy_tf.obs_ph: mbob,
-                        self.policy_tf.action_ph: seg["actions"],
-                        self.policy_tf.ret_ph: mbret,
-                    }
-                )
-                self.vfadam.update(grad, self.vf_stepsize)
-
-        return mean_losses, vpredbefore, tdlamret
+                self.sess.run(self.vf_optimizer, feed_dict={
+                    self.policy_tf.obs_ph: mbob,
+                    self.policy_tf.action_ph: seg["actions"],
+                    self.policy_tf.ret_ph: mbret,
+                })
 
     def _log_training(self, file_path, start_time):
         """Log training statistics.
@@ -815,6 +794,10 @@ class FeedForwardPolicy(Policy):
                 tf.float32,
                 shape=(None,),
                 name="old_vpred_ph")
+            self.flat_tangent = tf.placeholder(
+                dtype=tf.float32,
+                shape=[None],
+                name="flat_tan")
             self.phase_ph = tf.compat.v1.placeholder(
                 tf.bool,
                 name='phase')
