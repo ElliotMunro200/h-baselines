@@ -50,11 +50,7 @@ def iterbatches(arrays,
             yield tuple(a[batch_inds] for a in arrays)
 
 
-def traj_segment_generator(policy,
-                           env,
-                           horizon,
-                           reward_giver=None,
-                           gail=False):
+def traj_segment_generator(policy, env, horizon):
     """
     Compute target value using TD(lambda) estimator, and advantage with
     GAE(lambda)
@@ -62,15 +58,10 @@ def traj_segment_generator(policy,
     :param policy: (MLPPolicy) the policy
     :param env: (Gym Environment) the environment
     :param horizon: (int) the number of timesteps to run per batch
-    :param reward_giver: (TransitionClassifier) the reward predicter from
-        obsevation and action
-    :param gail: (bool) Whether we are using this generator for standard trpo
-        or with gail
     :return: (dict) generator that returns a dict with the following keys:
         - observations: (np.ndarray) observations
         - rewards: (numpy float) rewards (if gail is used it is the predicted
           reward)
-        - true_rewards: (numpy float) if gail is used it is the original reward
         - vpred: (numpy float) action logits
         - dones: (numpy bool) dones (is end of episode, used for logging)
         - episode_starts: (numpy bool)
@@ -79,12 +70,7 @@ def traj_segment_generator(policy,
         - nextvpred: (numpy float) next action logits
         - ep_rets: (float) cumulated current episode reward
         - ep_lens: (int) the length of the current episode
-        - ep_true_rets: (float) the real environment reward
     """
-    # Check when using GAIL
-    assert not (gail and reward_giver is None), \
-        "You must pass a reward giver when using GAIL"
-
     # Initialize state variables
     step = 0
     # not used, just so we have the datatype
@@ -94,26 +80,21 @@ def traj_segment_generator(policy,
     cur_ep_ret = 0  # return in current episode
     current_it_len = 0  # len of current iteration
     current_ep_len = 0  # len of current episode
-    cur_ep_true_ret = 0
-    ep_true_rets = []
     ep_rets = []  # returns of completed episodes in this segment
     ep_lens = []  # Episode lengths
 
     # Initialize history arrays
     observations = np.array([observation for _ in range(horizon)])
-    true_rewards = np.zeros(horizon, 'float32')
     rewards = np.zeros(horizon, 'float32')
     vpreds = np.zeros(horizon, 'float32')
     episode_starts = np.zeros(horizon, 'bool')
     dones = np.zeros(horizon, 'bool')
     actions = np.array([action for _ in range(horizon)])
-    states = None
     episode_start = True  # marks if we're on first timestep of an episode
-    done = False
 
     while True:
-        action, vpred, states, _ = policy.step(observation.reshape(
-            -1, *observation.shape), states, done)
+        action, vpred = policy.step(
+            observation.reshape(-1, *observation.shape))
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
@@ -123,22 +104,18 @@ def traj_segment_generator(policy,
                     "rewards": rewards,
                     "dones": dones,
                     "episode_starts": episode_starts,
-                    "true_rewards": true_rewards,
                     "vpred": vpreds,
                     "actions": actions,
                     "nextvpred": vpred[0] * (1 - episode_start),
                     "ep_rets": ep_rets,
                     "ep_lens": ep_lens,
-                    "ep_true_rets": ep_true_rets,
                     "total_timestep": current_it_len,
                     'continue_training': True
             }
-            _, vpred, _, _ = policy.step(
-                observation.reshape(-1, *observation.shape))
+            _, vpred = policy.step(observation.reshape(-1, *observation.shape))
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
             ep_rets = []
-            ep_true_rets = []
             ep_lens = []
             # Reset current iteration length
             current_it_len = 0
@@ -154,35 +131,24 @@ def traj_segment_generator(policy,
             clipped_action = np.clip(
                 action, env.action_space.low, env.action_space.high)
 
-        if gail:
-            reward = reward_giver.get_reward(observation, clipped_action[0])
-            observation, true_reward, done, info = env.step(clipped_action[0])
-        else:
-            observation, reward, done, info = env.step(clipped_action[0])
-            true_reward = reward
+        observation, reward, done, info = env.step(clipped_action[0])
 
         rewards[i] = reward
-        true_rewards[i] = true_reward
         dones[i] = done
         episode_start = done
 
         cur_ep_ret += reward
-        cur_ep_true_ret += true_reward
         current_it_len += 1
         current_ep_len += 1
         if done:
             # Retrieve unnormalized reward if using Monitor wrapper
             maybe_ep_info = info.get('episode')
             if maybe_ep_info is not None:
-                if not gail:
-                    cur_ep_ret = maybe_ep_info['r']
-                cur_ep_true_ret = maybe_ep_info['r']
+                cur_ep_ret = maybe_ep_info['r']
 
             ep_rets.append(cur_ep_ret)
-            ep_true_rets.append(cur_ep_true_ret)
             ep_lens.append(current_ep_len)
             cur_ep_ret = 0
-            cur_ep_true_ret = 0
             current_ep_len = 0
             observation = env.reset()
         step += 1
@@ -314,11 +280,9 @@ class TRPO(object):
     :param policy_kwargs: (dict) additional arguments to be passed to the
         policy on creation
     :param seed: (int) Seed for the pseudo-random generators (python, numpy,
-        tensorflow). If None (default), use random seed. Note that if you want
-        completely deterministic results, you must set `n_cpu_tf_sess` to 1.
-    :param n_cpu_tf_sess: (int) The number of threads for TensorFlow operations
-        If None, the number of cpu of the current machine will be used.
+        tensorflow)
     """
+
     def __init__(self,
                  policy,
                  env,
@@ -334,21 +298,14 @@ class TRPO(object):
                  verbose=0,
                  _init_setup_model=True,
                  policy_kwargs=None,
-                 seed=None,
-                 n_cpu_tf_sess=1):
+                 seed=None):
         self.policy = policy
         self.env = env
         self.verbose = verbose
-        # self._requires_vec_env = False
         self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
         self.observation_space = env.observation_space
         self.action_space = env.action_space
-        self.n_envs = None
-        self._vectorize_action = False
-        self.num_timesteps = 0
-        self.params = None
         self.seed = seed
-        self.n_cpu_tf_sess = n_cpu_tf_sess
 
         num_envs = 1
 
@@ -394,7 +351,7 @@ class TRPO(object):
 
         # Create the model variables and operations.
         if _init_setup_model:
-            self.trainable_vars = self.params = self.setup_model()
+            self.trainable_vars = self.setup_model()
 
     def setup_model(self):
         np.set_printoptions(precision=3)
@@ -405,17 +362,13 @@ class TRPO(object):
             np.random.seed(self.seed)
             random.seed(self.seed)
 
-            self.sess = make_session(
-                num_cpu=self.n_cpu_tf_sess, graph=self.graph)
+            self.sess = make_session(num_cpu=3, graph=self.graph)
 
             # Construct network for new policy
             self.policy_tf = self.policy(
                 self.sess,
                 self.observation_space,
                 self.action_space,
-                self.n_envs,
-                1,
-                None,
                 reuse=False,
                 **self.policy_kwargs,
             )
@@ -426,9 +379,6 @@ class TRPO(object):
                     self.sess,
                     self.observation_space,
                     self.action_space,
-                    self.n_envs,
-                    1,
-                    None,
                     reuse=False,
                     **self.policy_kwargs,
                 )
@@ -440,7 +390,10 @@ class TRPO(object):
                 self.ret = tf.placeholder(dtype=tf.float32, shape=[None])
 
                 observation = self.policy_tf.obs_ph
-                self.action = self.policy_tf.pdtype.sample_placeholder([None])
+                self.action = tf.placeholder(
+                    dtype=tf.float32,
+                    shape=[None, self.action_space.shape[0]],
+                    name="action_ph")
 
                 kloldnew = self.old_policy.proba_distribution.kl(
                     self.policy_tf.proba_distribution)
@@ -526,8 +479,6 @@ class TRPO(object):
                 self.policy_tf,
                 self.env,
                 self.timesteps_per_batch,
-                reward_giver=None,
-                gail=False,
             )
 
             episodes_so_far = 0
@@ -718,12 +669,6 @@ class TRPO(object):
         print("-" * 67)
         print('')
 
-    def _get_pretrain_placeholders(self):
-        pass
-
-    def save(self, save_path, cloudpickle=False):
-        pass
-
 
 # =========================================================================== #
 #                                    Policy                                   #
@@ -735,44 +680,6 @@ from itertools import zip_longest
 
 
 def mlp_extractor(flat_observations, net_arch, act_fun):
-    """
-    Constructs an MLP that receives observations as an input and outputs a
-    latent representation for the policy and
-    a value network. The ``net_arch`` parameter allows to specify the amount
-    and size of the hidden layers and how many
-    of them are shared between the policy network and the value network. It is
-    assumed to be a list with the following
-    structure:
-
-    1. An arbitrary length (zero allowed) number of integers each specifying
-    the number of units in a shared layer.
-       If the number of ints is zero, there will be no shared layers.
-    2. An optional dict, to specify the following non-shared layers for the
-    value network and the policy network.
-       It is formatted like ``dict(vf=[<value layer sizes>], pi=[<policy layer
-       sizes>])``.
-       If it is missing any of the keys (pi or vf), no non-shared layers (empty
-       list) is assumed.
-
-    For example to construct a network with one shared layer of size 55
-    followed by two non-shared layers for the value
-    network of size 255 and a single non-shared layer of size 128 for the
-    policy network, the following layers_spec
-    would be used: ``[55, dict(vf=[255, 255], pi=[128])]``. A simple shared
-    network topology with two layers of size 128
-    would be specified as [128, 128].
-
-    :param flat_observations: (tf.Tensor) The observations to base policy and
-        value function on.
-    :param net_arch: ([int or dict]) The specification of the policy and value
-        networks.
-        See above for details on its formatting.
-    :param act_fun: (tf function) The activation function to use for the
-        networks.
-    :return: (tf.Tensor, tf.Tensor) latent_policy, latent_value of the
-        specified network.
-        If all layers are shared, then ``latent_policy == latent_value``
-    """
     latent = flat_observations
     # Layer sizes of the network that only belongs to the policy network
     policy_only_layers = []
@@ -868,17 +775,6 @@ def ortho_init(scale=1.0):
 
 
 def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
-    """
-    Creates a fully connected layer for TensorFlow
-
-    :param input_tensor: (TensorFlow Tensor) The input tensor for the fully
-        connected layer
-    :param scope: (str) The TensorFlow variable scope
-    :param n_hidden: (int) The number of hidden neurons
-    :param init_scale: (int) The initialization scale
-    :param init_bias: (int) The initialization offset bias
-    :return: (TensorFlow Tensor) fully connected layer
-    """
     with tf.variable_scope(scope):
         n_input = input_tensor.get_shape()[1].value
         weight = tf.get_variable("w", [n_input, n_hidden],
@@ -889,32 +785,14 @@ def linear(input_tensor, scope, n_hidden, *, init_scale=1.0, init_bias=0.0):
 
 
 class DiagGaussianProbabilityDistribution(object):
-    def __init__(self, flat):
-        """
-        Probability distributions from multivariate Gaussian input
 
-        :param flat: ([float]) the multivariate Gaussian input data
-        """
-        self.flat = flat
-        mean, logstd = tf.split(
-            axis=len(flat.shape) - 1, num_or_size_splits=2, value=flat)
+    def __init__(self, mean, logstd):
         self.mean = mean
         self.logstd = logstd
         self.std = tf.exp(logstd)
         super(DiagGaussianProbabilityDistribution, self).__init__()
 
-    def mode(self):
-        # Bounds are taken into account outside this class (during training
-        # only)
-        return self.mean
-
     def logp(self, x):
-        """
-        returns the of the log likelihood
-
-        :param x: (str) the labels of each index
-        :return: ([float]) The log likelihood of the distribution
-        """
         return - self.neglogp(x)
 
     def neglogp(self, x):
@@ -935,9 +813,6 @@ class DiagGaussianProbabilityDistribution(object):
             self.logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
 
     def sample(self):
-        # Bounds are taken into account outside this class (during training
-        # only). Otherwise, it changes the distribution and breaks PPO2 for
-        # instance.
         return self.mean + self.std * tf.random_normal(
             tf.shape(self.mean), dtype=self.mean.dtype)
 
@@ -945,12 +820,6 @@ class DiagGaussianProbabilityDistribution(object):
 class DiagGaussianProbabilityDistributionType(object):
 
     def __init__(self, size):
-        """
-        The probability distribution type for multivariate Gaussian input
-
-        :param size: (int) the number of dimensions of the multivariate
-            gaussian
-        """
         self.size = size
 
     def proba_distribution_from_latent(self,
@@ -968,24 +837,11 @@ class DiagGaussianProbabilityDistributionType(object):
             name='pi/logstd',
             shape=[1, self.size],
             initializer=tf.zeros_initializer())
-        pdparam = tf.concat([mean, mean * 0.0 + logstd], axis=1)
         q_values = linear(
             vf_latent_vector, 'q', self.size,
             init_scale=init_scale, init_bias=init_bias)
-        return DiagGaussianProbabilityDistribution(pdparam), mean, q_values
-
-    def sample_placeholder(self, prepend_shape, name=None):
-        """
-        returns the TensorFlow placeholder for the sampling
-
-        :param prepend_shape: ([int]) the prepend shape
-        :param name: (str) the placeholder name
-        :return: (TensorFlow Tensor) the placeholder
-        """
-        return tf.placeholder(
-            dtype=tf.float32,
-            shape=prepend_shape + [self.size],
-            name=name)
+        return DiagGaussianProbabilityDistribution(
+            mean, mean * 0.0 + logstd), mean, q_values
 
 
 class FeedForwardPolicy(object):
@@ -996,14 +852,9 @@ class FeedForwardPolicy(object):
     :param sess: (TensorFlow session) The current TensorFlow session
     :param ob_space: (Gym Space) The observation space of the environment
     :param ac_space: (Gym Space) The action space of the environment
-    :param n_env: (int) The number of environments to run
-    :param n_steps: (int) The number of steps to run for each environment
-    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
     :param reuse: (bool) If the policy is reusable or not
     :param layers: ([int]) (deprecated, use net_arch instead) The size of the
         Neural network for the policy (if None, default to [64, 64])
-    :param net_arch: (list) Specification of the actor-critic policy network
-        architecture (see mlp_extractor documentation for details).
     :param act_fun: (tf.func) the activation function to use in the neural
         network.
     """
@@ -1012,20 +863,13 @@ class FeedForwardPolicy(object):
                  sess,
                  ob_space,
                  ac_space,
-                 n_env,
-                 n_steps,
-                 n_batch,
                  reuse=False,
                  layers=None,
-                 net_arch=None,
                  act_fun=tf.tanh):
         self.sess = sess
         self.reuse = reuse
         self.ob_space = ob_space
         self.ac_space = ac_space
-        self.n_env = n_env
-        self.n_steps = n_steps
-        self.n_batch = n_batch
         self.pdtype = DiagGaussianProbabilityDistributionType(
             ac_space.shape[0])
 
@@ -1036,10 +880,9 @@ class FeedForwardPolicy(object):
                 name="obs_ph")
             self.action_ph = None
 
-        if net_arch is None:
-            if layers is None:
-                layers = [64, 64]
-            net_arch = [dict(vf=layers, pi=layers)]
+        if layers is None:
+            layers = [64, 64]
+        net_arch = [dict(vf=layers, pi=layers)]
 
         with tf.variable_scope("model", reuse=reuse):
             pi_latent, vf_latent = mlp_extractor(
@@ -1047,31 +890,21 @@ class FeedForwardPolicy(object):
 
             self.value_fn = linear(vf_latent, 'vf', 1)
 
-            self.proba_distribution, self.policy, self.q_value = \
+            self.proba_distribution, self.policy, _ = \
                 self.pdtype.proba_distribution_from_latent(
                     pi_latent, vf_latent, init_scale=0.01)
 
-        self._setup_init()
-
-    def step(self, obs, state=None, mask=None, deterministic=False):
-        if deterministic:
-            action, value, neglogp = self.sess.run(
-                [self.deterministic_action, self.value_flat, self.neglogp],
-                {self.obs_ph: obs})
-        else:
-            action, value, neglogp = self.sess.run(
-                [self.action, self.value_flat, self.neglogp],
-                {self.obs_ph: obs})
-        return action, value, None, neglogp
-
-    def _setup_init(self):
-        """Sets up the distributions, actions, and value."""
         with tf.variable_scope("output", reuse=True):
             assert self.policy is not None and self.proba_distribution \
                 is not None and self.value_fn is not None
             self.action = self.proba_distribution.sample()
-            self.deterministic_action = self.proba_distribution.mode()
+            self.deterministic_action = self.proba_distribution.mean
             self.neglogp = self.proba_distribution.neglogp(self.action)
             self.policy_proba = [self.proba_distribution.mean,
                                  self.proba_distribution.std]
             self.value_flat = self.value_fn[:, 0]
+
+    def step(self, obs):
+        action, value = self.sess.run(
+            [self.action, self.value_flat], feed_dict={self.obs_ph: obs})
+        return action, value
