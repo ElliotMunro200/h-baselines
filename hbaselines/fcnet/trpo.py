@@ -14,41 +14,6 @@ from hbaselines.utils.tf_util import get_trainable_vars
 import stable_baselines.common.tf_util as tf_util
 
 
-def iterbatches(arrays,
-                *,
-                num_batches=None,
-                batch_size=None,
-                shuffle=True,
-                include_final_partial_batch=True):
-    """
-    Iterates over arrays in batches, must provide either num_batches or
-    batch_size, the other must be None.
-
-    :param arrays: (tuple) a tuple of arrays
-    :param num_batches: (int) the number of batches, must be None is batch_size
-        is defined
-    :param batch_size: (int) the size of the batch, must be None is num_batches
-        is defined
-    :param shuffle: (bool) enable auto shuffle
-    :param include_final_partial_batch: (bool) add the last batch if not the
-        same size as the batch_size
-    :return: (tuples) a tuple of a batch of the arrays
-    """
-    assert (num_batches is None) != (batch_size is None), \
-        'Provide num_batches or batch_size, but not both'
-    arrays = tuple(map(np.asarray, arrays))
-    n_samples = arrays[0].shape[0]
-    assert all(a.shape[0] == n_samples for a in arrays[1:])
-    inds = np.arange(n_samples)
-    if shuffle:
-        np.random.shuffle(inds)
-    sections = np.arange(0, n_samples, batch_size)[1:] \
-        if num_batches is None else num_batches
-    for batch_inds in np.array_split(inds, sections):
-        if include_final_partial_batch or len(batch_inds) == batch_size:
-            yield tuple(a[batch_inds] for a in arrays)
-
-
 def traj_segment_generator(policy, env, horizon):
     """
     Compute target value using TD(lambda) estimator, and advantage with
@@ -354,7 +319,6 @@ class TRPO(object):
                 ac_space=self.action_space,
                 co_space=None,
                 verbose=self.verbose,
-                learning_rate=1e-3,
                 model_params=dict(
                     model_type="fcnet",
                     layers=[256, 256],
@@ -371,86 +335,18 @@ class TRPO(object):
                     kernel_sizes=[5, 5, 5],
                     strides=[2, 2, 2],
                 ),
-                n_minibatches=1e-3,
-                n_opt_epochs=1e-3,
-                gamma=1e-3,
-                lam=1e-3,
-                ent_coef=1e-3,
-                vf_coef=1e-3,
-                max_grad_norm=1e-3,
-                cliprange=1e-3,
-                cliprange_vf=1e-3,
-                l2_penalty=1e-3,
+                gamma=self.gamma,
+                lam=self.lam,
+                ent_coef=self.entcoeff,
+                cg_iters=self.cg_iters,
+                vf_iters=self.vf_iters,
+                vf_stepsize=self.vf_stepsize,
+                cg_damping=self.cg_damping,
+                max_kl=self.max_kl,
+                l2_penalty=0,
                 scope=None,
                 num_envs=1,
             )
-
-            with tf.variable_scope("loss", reuse=False):
-                kloldnew = self.policy_tf.kl()
-                ent = self.policy_tf.entropy()
-                meankl = tf.reduce_mean(kloldnew)
-                meanent = tf.reduce_mean(ent)
-                entbonus = self.entcoeff * meanent
-
-                # advantage * pnew / pold
-                ratio = tf.exp(
-                    self.policy_tf.logp(self.policy_tf.action_ph, old=False) -
-                    self.policy_tf.logp(self.policy_tf.action_ph, old=True))
-                surrgain = tf.reduce_mean(ratio * self.policy_tf.advs_ph)
-
-                optimgain = surrgain + entbonus
-                self.losses = [optimgain, meankl, entbonus, surrgain, meanent]
-
-                all_var_list = get_trainable_vars("model")
-                var_list = [
-                    v for v in all_var_list
-                    if "/vf" not in v.name and "/q/" not in v.name]
-                vf_var_list = [
-                    v for v in all_var_list
-                    if "/pi" not in v.name and "/logstd" not in v.name]
-
-                self.get_flat = tf_util.GetFlat(var_list, sess=self.sess)
-                self.set_from_flat = tf_util.SetFromFlat(
-                    var_list, sess=self.sess)
-
-                klgrads = tf.gradients(meankl, var_list)
-                shapes = [var.get_shape().as_list() for var in var_list]
-                start = 0
-                tangents = []
-                for shape in shapes:
-                    var_size = tf_util.intprod(shape)
-                    tangents.append(tf.reshape(
-                        self.policy_tf.flat_tangent[start: start + var_size],
-                        shape))
-                    start += var_size
-                gvp = tf.add_n(
-                    [tf.reduce_sum(grad * tangent)
-                     for (grad, tangent) in zip(klgrads, tangents)])
-                # Fisher vector products
-                self.fvp = tf_util.flatgrad(gvp, var_list)
-
-                self.assign_old_eq_new = tf.group(*[
-                    tf.assign(oldv, newv) for (oldv, newv) in
-                    zip(get_globals_vars("oldpi"), get_globals_vars("model"))])
-
-                # Create the value function optimizer.
-                vferr = tf.reduce_mean(tf.square(
-                    self.policy_tf.value_flat - self.policy_tf.ret_ph))
-                optimizer = tf.compat.v1.train.AdamOptimizer(self.vf_stepsize)
-                self.vf_optimizer = optimizer.minimize(
-                    vferr,
-                    var_list=vf_var_list,
-                )
-
-                # Initialize the model parameters and optimizers.
-                with self.sess.as_default():
-                    self.sess.run(tf.compat.v1.global_variables_initializer())
-                    self.policy_tf.initialize()
-
-                th_init = self.get_flat()
-                self.set_from_flat(th_init)
-
-            self.grad = tf_util.flatgrad(optimgain, var_list)
 
         return get_trainable_vars("model") + get_trainable_vars("oldpi")
 
@@ -495,98 +391,7 @@ class TRPO(object):
                 self.epoch += 1
 
     def _train(self, seg):
-
-        def fisher_vector_product(vec):
-            return self.sess.run(self.fvp, feed_dict={
-                self.policy_tf.flat_tangent: vec,
-                self.policy_tf.obs_ph: fvpargs[0],
-                self.policy_tf.action_ph: fvpargs[1],
-                self.policy_tf.advs_ph: fvpargs[2],
-            }) + self.cg_damping * vec
-
-        add_vtarg_and_adv(seg, self.gamma, self.lam)
-        atarg, tdlamret = seg["adv"], seg["tdlamret"]
-
-        # standardized advantage function estimate
-        atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
-
-        args = seg["observations"], seg["actions"], atarg
-        # Subsampling: see p40-42 of John Schulman thesis
-        # http://joschu.net/docs/thesis.pdf
-        fvpargs = [arr[::5] for arr in args]
-
-        self.sess.run(self.assign_old_eq_new)
-
-        # run loss backprop with summary, and save the metadata (memory,
-        # compute time, ...)
-        grad, *lossbefore = self.sess.run(
-            [self.grad] + self.losses,
-            feed_dict={
-                self.policy_tf.obs_ph: seg["observations"],
-                self.policy_tf.action_ph: seg["actions"],
-                self.policy_tf.advs_ph: atarg,
-                self.policy_tf.ret_ph: tdlamret,
-            }
-        )
-
-        lossbefore = np.array(lossbefore)
-        if np.allclose(grad, 0):
-            print("Got zero gradient. not updating")
-        else:
-            stepdir = conjugate_gradient(
-                fisher_vector_product,
-                grad,
-                cg_iters=self.cg_iters,
-                verbose=self.verbose >= 1,
-            )
-            assert np.isfinite(stepdir).all()
-            shs = .5 * stepdir.dot(fisher_vector_product(stepdir))
-            # abs(shs) to avoid taking square root of negative values
-            lagrange_multiplier = np.sqrt(abs(shs) / self.max_kl)
-            fullstep = stepdir / lagrange_multiplier
-            expectedimprove = grad.dot(fullstep)
-            surrbefore = lossbefore[0]
-            stepsize = 1.0
-            thbefore = self.get_flat()
-            for _ in range(10):
-                thnew = thbefore + fullstep * stepsize
-                self.set_from_flat(thnew)
-                mean_losses = surr, kl_loss, *_ = self.sess.run(
-                    self.losses,
-                    feed_dict={
-                        self.policy_tf.obs_ph: seg["observations"],
-                        self.policy_tf.action_ph: seg["actions"],
-                        self.policy_tf.advs_ph: atarg,
-                    }
-                )
-                improve = surr - surrbefore
-                print("Expected: %.3f Actual: %.3f" % (
-                    expectedimprove, improve))
-                if not np.isfinite(mean_losses).all():
-                    print("Got non-finite value of losses -- bad!")
-                elif kl_loss > self.max_kl * 1.5:
-                    print("violated KL constraint. shrinking step.")
-                elif improve < 0:
-                    print("surrogate didn't improve. shrinking step.")
-                else:
-                    print("Stepsize OK!")
-                    break
-                stepsize *= .5
-            else:
-                print("couldn't compute a good step")
-                self.set_from_flat(thbefore)
-
-        for _ in range(self.vf_iters):
-            for (mbob, mbret) in iterbatches(
-                    (seg["observations"], seg["tdlamret"]),
-                    include_final_partial_batch=False,
-                    batch_size=128,
-                    shuffle=True):
-                self.sess.run(self.vf_optimizer, feed_dict={
-                    self.policy_tf.obs_ph: mbob,
-                    self.policy_tf.action_ph: seg["actions"],
-                    self.policy_tf.ret_ph: mbret,
-                })
+        self.policy_tf.update(seg=seg)
 
     def _log_training(self, file_path, start_time):
         """Log training statistics.
@@ -661,18 +466,16 @@ class FeedForwardPolicy(Policy):
                  ac_space,
                  co_space,
                  verbose,
-                 learning_rate,
+                 l2_penalty,
                  model_params,
-                 n_minibatches,
-                 n_opt_epochs,
                  gamma,
                  lam,
                  ent_coef,
-                 vf_coef,
-                 max_grad_norm,
-                 cliprange,
-                 cliprange_vf,
-                 l2_penalty,
+                 cg_iters,
+                 vf_iters,
+                 vf_stepsize,
+                 cg_damping,
+                 max_kl,
                  scope=None,
                  num_envs=1):
         """Instantiate the policy object.
@@ -694,12 +497,6 @@ class FeedForwardPolicy(Policy):
             L2 regularization penalty. This is applied to the policy network.
         model_params : dict
             dictionary of model-specific parameters. See parent class.
-        learning_rate : float
-            the learning rate
-        n_minibatches : int
-            number of training minibatches per update
-        n_opt_epochs : int
-            number of training epochs per update procedure
         gamma : float
             the discount factor
         lam : float
@@ -707,20 +504,16 @@ class FeedForwardPolicy(Policy):
             Estimator
         ent_coef : float
             entropy coefficient for the loss calculation
-        vf_coef : float
-            value function coefficient for the loss calculation
-        max_grad_norm : float
-            the maximum value for the gradient clipping
-        cliprange : float or callable
-            clipping parameter, it can be a function
-        cliprange_vf : float or callable
-            clipping parameter for the value function, it can be a function.
-            This is a parameter specific to the OpenAI implementation. If None
-            is passed (default), then `cliprange` (that is used for the policy)
-            will be used. IMPORTANT: this clipping depends on the reward
-            scaling. To deactivate value function clipping (and recover the
-            original PPO implementation), you have to pass a negative value
-            (e.g. -1).
+        cg_iters : TODO
+            TODO
+        vf_iters : TODO
+            TODO
+        vf_stepsize : TODO
+            TODO
+        cg_damping : TODO
+            TODO
+        max_kl : TODO
+            TODO
         """
         super(FeedForwardPolicy, self).__init__(
             sess=sess,
@@ -733,16 +526,14 @@ class FeedForwardPolicy(Policy):
             num_envs=num_envs,
         )
 
-        self.learning_rate = learning_rate
-        self.n_minibatches = n_minibatches
-        self.n_opt_epochs = n_opt_epochs
         self.gamma = gamma
         self.lam = lam
         self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
-        self.max_grad_norm = max_grad_norm
-        self.cliprange = cliprange
-        self.cliprange_vf = cliprange_vf
+        self.cg_iters = cg_iters
+        self.vf_iters = vf_iters
+        self.vf_stepsize = vf_stepsize
+        self.cg_damping = cg_damping
+        self.max_kl = max_kl
 
         # Create variables to store on-policy data.
         self.mb_rewards = [[] for _ in range(num_envs)]
@@ -981,7 +772,78 @@ class FeedForwardPolicy(Policy):
 
     def _setup_optimizers(self, scope):
         """Create the actor and critic optimizers."""
-        pass  # TODO
+        with tf.variable_scope("loss", reuse=False):
+            # TODO
+            kloldnew = tf.reduce_sum(
+                self.pi_logstd - self.old_pi_logstd + (
+                    tf.square(self.old_pi_std) +
+                    tf.square(self.old_pi_mean - self.pi_mean))
+                / (2.0 * tf.square(self.pi_std)) - 0.5, axis=-1)
+            meankl = tf.reduce_mean(kloldnew)
+
+            # TODO
+            entropy = tf.reduce_sum(
+                self.pi_logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
+            meanent = tf.reduce_mean(entropy)
+            entbonus = self.ent_coef * meanent
+
+            # advantage * pnew / pold
+            ratio = tf.exp(
+                self.logp(self.action_ph, old=False) -
+                self.logp(self.action_ph, old=True))
+            surrgain = tf.reduce_mean(ratio * self.advs_ph)
+
+            optimgain = surrgain + entbonus
+            self.losses = [optimgain, meankl, entbonus, surrgain, meanent]
+
+            all_var_list = get_trainable_vars("model")
+            var_list = [
+                v for v in all_var_list
+                if "/vf" not in v.name and "/q/" not in v.name]
+            vf_var_list = [
+                v for v in all_var_list
+                if "/pi" not in v.name and "/logstd" not in v.name]
+
+            self.get_flat = tf_util.GetFlat(var_list, sess=self.sess)
+            self.set_from_flat = tf_util.SetFromFlat(
+                var_list, sess=self.sess)
+
+            klgrads = tf.gradients(meankl, var_list)
+            shapes = [var.get_shape().as_list() for var in var_list]
+            start = 0
+            tangents = []
+            for shape in shapes:
+                var_size = tf_util.intprod(shape)
+                tangents.append(tf.reshape(
+                    self.flat_tangent[start: start + var_size], shape))
+                start += var_size
+            gvp = tf.add_n(
+                [tf.reduce_sum(grad * tangent)
+                 for (grad, tangent) in zip(klgrads, tangents)])
+            # Fisher vector products
+            self.fvp = tf_util.flatgrad(gvp, var_list)
+
+            self.assign_old_eq_new = tf.group(*[
+                tf.assign(oldv, newv) for (oldv, newv) in
+                zip(get_globals_vars("oldpi"), get_globals_vars("model"))])
+
+        # Create the value function optimizer.
+        vferr = tf.reduce_mean(tf.square(
+            self.value_flat - self.ret_ph))
+        optimizer = tf.compat.v1.train.AdamOptimizer(self.vf_stepsize)
+        self.vf_optimizer = optimizer.minimize(
+            vferr,
+            var_list=vf_var_list,
+        )
+
+        # Initialize the model parameters and optimizers.
+        with self.sess.as_default():
+            self.sess.run(tf.compat.v1.global_variables_initializer())
+
+        th_init = self.get_flat()
+        self.set_from_flat(th_init)
+
+        self.grad = tf_util.flatgrad(optimgain, var_list)
 
     def _setup_stats(self, base):
         """Create the running means and std of the model inputs and outputs.
@@ -990,6 +852,118 @@ class FeedForwardPolicy(Policy):
         tensorboard for additional storage.
         """
         pass  # TODO
+
+    def update(self, update_actor=True, **kwargs):
+        seg = kwargs["seg"]
+        add_vtarg_and_adv(seg, self.gamma, self.lam)
+
+        self.update_from_batch(
+            obs=seg["observations"],
+            returns=seg["tdlamret"],
+            actions=seg["actions"],
+            advs=seg["adv"],
+        )
+
+    def update_from_batch(self, obs, returns, actions, advs):
+        """
+
+        :param obs:
+        :param returns:
+        :param actions:
+        :param advs:
+        :return:
+        """
+        def fisher_vector_product(vec):
+            return self.sess.run(self.fvp, feed_dict={
+                self.flat_tangent: vec,
+                self.obs_ph: fvpargs[0],
+                self.action_ph: fvpargs[1],
+                self.advs_ph: fvpargs[2],
+            }) + self.cg_damping * vec
+
+        atarg, tdlamret = advs, returns
+
+        # standardized advantage function estimate
+        atarg = (atarg - atarg.mean()) / (atarg.std() + 1e-8)
+
+        args = obs, actions, atarg
+
+        # Subsampling: see p40-42 of John Schulman thesis
+        # http://joschu.net/docs/thesis.pdf
+        fvpargs = [arr[::5] for arr in args]
+
+        self.sess.run(self.assign_old_eq_new)
+
+        # run loss backprop with summary, and save the metadata (memory,
+        # compute time, ...)
+        grad, *lossbefore = self.sess.run(
+            [self.grad] + self.losses,
+            feed_dict={
+                self.obs_ph: obs,
+                self.action_ph: actions,
+                self.advs_ph: atarg,
+                self.ret_ph: tdlamret,
+            }
+        )
+
+        lossbefore = np.array(lossbefore)
+        if np.allclose(grad, 0):
+            print("Got zero gradient. not updating")
+        else:
+            stepdir = conjugate_gradient(
+                fisher_vector_product,
+                grad,
+                cg_iters=self.cg_iters,
+                verbose=self.verbose >= 1,
+            )
+            assert np.isfinite(stepdir).all()
+            shs = .5 * stepdir.dot(fisher_vector_product(stepdir))
+            # abs(shs) to avoid taking square root of negative values
+            lagrange_multiplier = np.sqrt(abs(shs) / self.max_kl)
+            fullstep = stepdir / lagrange_multiplier
+            expectedimprove = grad.dot(fullstep)
+            surrbefore = lossbefore[0]
+            stepsize = 1.0
+            thbefore = self.get_flat()
+            for _ in range(10):
+                thnew = thbefore + fullstep * stepsize
+                self.set_from_flat(thnew)
+                mean_losses = surr, kl_loss, *_ = self.sess.run(
+                    self.losses,
+                    feed_dict={
+                        self.obs_ph: obs,
+                        self.action_ph: actions,
+                        self.advs_ph: atarg,
+                    }
+                )
+                improve = surr - surrbefore
+                print("Expected: %.3f Actual: %.3f" % (
+                    expectedimprove, improve))
+                if not np.isfinite(mean_losses).all():
+                    print("Got non-finite value of losses -- bad!")
+                elif kl_loss > self.max_kl * 1.5:
+                    print("violated KL constraint. shrinking step.")
+                elif improve < 0:
+                    print("surrogate didn't improve. shrinking step.")
+                else:
+                    print("Stepsize OK!")
+                    break
+                stepsize *= .5
+            else:
+                print("couldn't compute a good step")
+                self.set_from_flat(thbefore)
+
+        for _ in range(self.vf_iters):
+            for (mbob, mbret) in self.iterbatches(
+                    (obs, returns),
+                    include_final_partial_batch=False,
+                    batch_size=128,
+                    shuffle=True):
+                self.sess.run(self.vf_optimizer, feed_dict={
+                    self.obs_ph: mbob,
+                    self.action_ph: actions,
+                    self.ret_ph: mbret,
+                })
 
     def initialize(self):
         """See parent class."""
@@ -1014,21 +988,49 @@ class FeedForwardPolicy(Policy):
 
     def _old_neglogp(self, x):
         return 0.5 * tf.reduce_sum(
-            tf.square((x - self.old_pi_mean) / self.old_pi_std), axis=-1) + 0.5 * \
-            np.log(2.0 * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
+            tf.square((x - self.old_pi_mean) / self.old_pi_std), axis=-1) \
+            + 0.5 * np.log(2. * np.pi) * tf.cast(tf.shape(x)[-1], tf.float32) \
             + tf.reduce_sum(self.old_pi_logstd, axis=-1)
 
-    def kl(self):
-        return tf.reduce_sum(
-            self.pi_logstd - self.old_pi_logstd + (
-                tf.square(self.old_pi_std) +
-                tf.square(self.old_pi_mean - self.pi_mean))
-            / (2.0 * tf.square(self.pi_std)) - 0.5, axis=-1)
+    @staticmethod
+    def iterbatches(arrays,
+                    *,
+                    num_batches=None,
+                    batch_size=None,
+                    shuffle=True,
+                    include_final_partial_batch=True):
+        """Iterate over arrays in batches.
 
-    def entropy(self):
-        return tf.reduce_sum(
-            self.pi_logstd + .5 * np.log(2.0 * np.pi * np.e), axis=-1)
+        Must provide either num_batches or batch_size, the other must be None.
 
-    def sample(self):
-        return self.pi_mean + self.pi_std * tf.random_normal(
-            tf.shape(self.pi_mean), dtype=self.pi_mean.dtype)
+        Parameters
+        ----------
+        arrays : tuple
+            a tuple of arrays
+        num_batches : int
+            the number of batches, must be None is batch_size is defined
+        batch_size : int
+            the size of the batch, must be None is num_batches is defined
+        shuffle : bool
+            enable auto shuffle
+        include_final_partial_batch : bool
+            add the last batch if not the same size as the batch_size
+
+        Returns
+        -------
+        tuples
+            a tuple of a batch of the arrays
+        """
+        assert (num_batches is None) != (batch_size is None), \
+            'Provide num_batches or batch_size, but not both'
+        arrays = tuple(map(np.asarray, arrays))
+        n_samples = arrays[0].shape[0]
+        assert all(a.shape[0] == n_samples for a in arrays[1:])
+        inds = np.arange(n_samples)
+        if shuffle:
+            np.random.shuffle(inds)
+        sections = np.arange(0, n_samples, batch_size)[1:] \
+            if num_batches is None else num_batches
+        for batch_inds in np.array_split(inds, sections):
+            if include_final_partial_batch or len(batch_inds) == batch_size:
+                yield tuple(a[batch_inds] for a in arrays)
