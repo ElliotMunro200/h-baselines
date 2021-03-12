@@ -202,6 +202,7 @@ class FeedForwardPolicy(Policy):
         self.max_grad_norm = max_grad_norm
         self.cliprange = cliprange
         self.cliprange_vf = cliprange_vf
+        self.max_traj_length = 100
 
         # Create variables to store on-policy data.
         self.mb_rewards = [[] for _ in range(num_envs)]
@@ -607,6 +608,22 @@ class FeedForwardPolicy(Policy):
 
     def update(self, **kwargs):
         """See parent class."""
+        # In case not all environment numbers were used, reduce the shape of
+        # the datasets.
+        num_envs = sum([
+            int(self.last_obs[i] is not None) for i in range(self.num_envs)])
+
+        self.mb_rewards = self.mb_rewards[:num_envs]
+        self.mb_obs = self.mb_obs[:num_envs]
+        self.mb_contexts = self.mb_contexts[:num_envs]
+        self.mb_actions = self.mb_actions[:num_envs]
+        self.mb_values = self.mb_values[:num_envs]
+        self.mb_neglogpacs = self.mb_neglogpacs[:num_envs]
+        self.mb_dones = self.mb_dones[:num_envs]
+        self.mb_all_obs = self.mb_all_obs[:num_envs]
+        self.mb_returns = self.mb_returns[:num_envs]
+        self.last_obs = self.last_obs[:num_envs]
+
         # Compute the last estimated value.
         last_values = [
             self.sess.run(
@@ -616,7 +633,7 @@ class FeedForwardPolicy(Policy):
                     self.phase_ph: 0,
                     self.rate_ph: 0.0,
                 })
-            for env_num in range(self.num_envs)
+            for env_num in range(num_envs)
         ]
 
         (self.mb_obs,
@@ -641,7 +658,8 @@ class FeedForwardPolicy(Policy):
             last_values=last_values,
             gamma=self.gamma,
             lam=self.lam,
-            num_envs=self.num_envs,
+            num_envs=num_envs,
+            max_traj_length=self.max_traj_length,
         )
 
         # Run the optimization procedure.
