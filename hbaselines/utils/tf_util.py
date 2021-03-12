@@ -852,13 +852,13 @@ def process_minibatch(mb_obs,
              mb_rewards[env_num],
              mb_actions[env_num],
              mb_values[env_num],
-             mb_neglogpacs[env_num],
+             _,
              mb_dones[env_num]) = segment_trajectory(
                 mb_obs=mb_obs[env_num].copy(),
                 mb_rewards=mb_rewards[env_num],
                 mb_actions=mb_actions[env_num],
                 mb_values=mb_values[env_num],
-                mb_neglogpacs=mb_neglogpacs[env_num],
+                mb_neglogpacs=None,
                 mb_dones=mb_dones[env_num],
                 max_traj_length=max_traj_length,
             )
@@ -878,7 +878,6 @@ def process_minibatch(mb_obs,
     mb_rewards = [x for x in mb_rewards if len(x) > 0]
     mb_actions = [x for x in mb_actions if len(x) > 0]
     mb_values = [x for x in mb_values if len(x) > 0]
-    mb_neglogpacs = [x for x in mb_neglogpacs if len(x) > 0]
     mb_dones = [x for x in mb_dones if len(x) > 0]
 
     # Concatenate the stored data.
@@ -981,7 +980,8 @@ def segment_trajectory(mb_obs,
     mb_rewards = mb_rewards[valid_trajectories]
     mb_actions = mb_actions[valid_trajectories]
     mb_values = mb_values[valid_trajectories]
-    mb_neglogpacs = mb_neglogpacs[valid_trajectories]
+    if mb_neglogpacs is not None:
+        mb_neglogpacs = mb_neglogpacs[valid_trajectories]
     mb_dones = mb_dones[valid_trajectories]
 
     # ======================================================================= #
@@ -1021,7 +1021,8 @@ def segment_trajectory(mb_obs,
             new_mb_rewards.extend(list(mb_rewards[indx]))
             new_mb_actions.extend(list(mb_actions[indx]))
             new_mb_values.extend(list(mb_values[indx]))
-            new_mb_neglogpacs.extend(list(mb_neglogpacs[indx]))
+            if mb_neglogpacs is not None:
+                new_mb_neglogpacs.extend(list(mb_neglogpacs[indx]))
             new_mb_dones.extend([0] * (max_traj_length - 1) + [1])
 
         # Convert to array
@@ -1029,10 +1030,11 @@ def segment_trajectory(mb_obs,
         mb_rewards = np.array(new_mb_rewards)
         mb_actions = np.array(new_mb_actions)
         mb_values = np.array(new_mb_values)
-        mb_neglogpacs = np.array(new_mb_neglogpacs)
+        if mb_neglogpacs is not None:
+            mb_neglogpacs = np.array(new_mb_neglogpacs)
         mb_dones = np.array(new_mb_dones)
 
-    return mb_obs, mb_rewards, mb_actions, mb_values,  mb_neglogpacs, mb_dones
+    return mb_obs, mb_rewards, mb_actions, mb_values, mb_neglogpacs, mb_dones
 
 
 def setup_target_updates(model_scope, target_scope, scope, tau, verbose):
