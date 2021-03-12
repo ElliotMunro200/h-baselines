@@ -563,8 +563,6 @@ def create_fcnet(obs,
             policy_mean = layer(
                 pi_h, num_output, 'mean',
                 act_fun=None,
-                kernel_initializer=tf.random_uniform_initializer(
-                    minval=-3e-3, maxval=3e-3)
             )
 
             # Create the output log_std.
