@@ -12,11 +12,90 @@ from hbaselines.utils.tf_util import get_trainable_vars
 from hbaselines.utils.tf_util import flatgrad
 from hbaselines.utils.tf_util import SetFromFlat
 from hbaselines.utils.tf_util import GetFlat
+from hbaselines.utils.tf_util import explained_variance
 
 
 class FeedForwardPolicy(Policy):
-    """TODO.
+    """TRPO-compatible feedforward policy..
 
+    Attributes
+    ----------
+    gamma : float
+        the discount factor
+    lam : float
+        factor for trade-off of bias vs variance for Generalized Advantage
+        Estimator
+    ent_coef : float
+        entropy coefficient for the loss calculation
+    cg_iters : int
+        the number of iterations for the conjugate gradient calculation
+    vf_iters : int
+        the value function’s number iterations for learning
+    vf_stepsize : float
+        the value function stepsize
+    cg_damping : float
+        the compute gradient dampening factor
+    max_kl : float
+        the Kullback-Leibler loss threshold
+    mb_rewards : array_like
+        a minibatch of environment rewards
+    mb_obs : array_like
+        a minibatch of observations
+    mb_contexts : array_like
+        a minibatch of contextual terms
+    mb_actions : array_like
+        a minibatch of actions
+    mb_values : array_like
+        a minibatch of estimated values by the policy
+    mb_dones : array_like
+        a minibatch of done masks
+    mb_all_obs : array_like
+        a minibatch of full-state observations
+    mb_returns : array_like
+        a minibatch of expected discounted returns
+    last_obs : array_like
+        the most recent observation from each environment. Used to compute the
+        GAE terms.
+    mb_advs : array_like
+        a minibatch of estimated advantages
+    action_ph : tf.compat.v1.placeholder
+        placeholder for the actions
+    obs_ph : tf.compat.v1.placeholder
+        placeholder for the observations
+    ret_ph : tf.compat.v1.placeholder
+        placeholder for the discounted returns
+    advs_ph : tf.compat.v1.placeholder
+        placeholder for the advantages
+    old_vpred_ph : tf.compat.v1.placeholder
+        placeholder for the predicted value
+    flat_tangent : tf.compat.v1.placeholder
+        placeholder for the tangents
+    phase_ph : tf.compat.v1.placeholder
+        a placeholder that defines whether training is occurring for the batch
+        normalization layer. Set to True in training and False in testing.
+    rate_ph : tf.compat.v1.placeholder
+        the probability that each element is dropped if dropout is implemented
+    action : tf.Variable
+        the output from the policy/actor
+    pi_mean : tf.Variable
+        the output from the policy's mean term
+    pi_logstd : tf.Variable
+        the output from the policy's log-std term
+    value_fn : tf.Variable
+        the output from the value function
+    value_flat : tf.Variable
+        the output from the flattened value function
+    old_action : tf.Variable
+        the output from the previous instantiation of the policy/actor
+    pi_mean : tf.Variable
+        the output from the previous instantiation of the policy's mean term
+    pi_logstd : tf.Variable
+        the output from the previous instantiation of the policy's log-std term
+    old_value_fn : tf.Variable
+        the output from the previous instantiation of the value function
+    value_flat : tf.Variable
+        the output from the previous instantiation of the flattened value
+        function
     """
 
     def __init__(self,
@@ -63,16 +142,16 @@ class FeedForwardPolicy(Policy):
             Estimator
         ent_coef : float
             entropy coefficient for the loss calculation
-        cg_iters : TODO
-            TODO
-        vf_iters : TODO
-            TODO
-        vf_stepsize : TODO
-            TODO
-        cg_damping : TODO
-            TODO
-        max_kl : TODO
-            TODO
+        cg_iters : int
+            the number of iterations for the conjugate gradient calculation
+        vf_iters : int
+            the value function’s number iterations for learning
+        vf_stepsize : float
+            the value function stepsize
+        cg_damping : float
+            the compute gradient dampening factor
+        max_kl : float
+            the Kullback-Leibler loss threshold
         """
         super(FeedForwardPolicy, self).__init__(
             sess=sess,
@@ -356,7 +435,7 @@ class FeedForwardPolicy(Policy):
             optimgain = surrgain + entbonus
             self.losses = [optimgain, meankl, entbonus, surrgain, meanent]
 
-            all_var_list = get_trainable_vars("model")
+            all_var_list = get_trainable_vars(scope_name)
             var_list = [
                 v for v in all_var_list
                 if "/vf" not in v.name and "/q/" not in v.name]
@@ -418,7 +497,26 @@ class FeedForwardPolicy(Policy):
         This method also adds the same running means and stds as scalars to
         tensorboard for additional storage.
         """
-        pass  # TODO
+        ops = {
+            "reference_action_mean": tf.reduce_mean(self.pi_mean),
+            "reference_action_std": tf.reduce_mean(self.pi_logstd),
+            "discounted_returns": tf.reduce_mean(self.ret_ph),
+            "advantage": tf.reduce_mean(self.advs_ph),
+            "old_value_pred": tf.reduce_mean(self.old_vpred_ph),
+            "optimgain": self.losses[0],
+            "meankl": self.losses[1],
+            "entloss": self.losses[2],
+            "surrgain": self.losses[3],
+            "entropy": self.losses[4],
+            "explained_variance": explained_variance(
+                self.old_vpred_ph, self.ret_ph)
+        }
+
+        # Add all names and ops to the tensorboard summary.
+        for key in ops.keys():
+            name = "{}/{}".format(base, key)
+            op = ops[key]
+            tf.compat.v1.summary.scalar(name, op)
 
     def get_action(self, obs, context, apply_noise, random_actions, env_num=0):
         """See parent class."""

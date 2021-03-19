@@ -141,15 +141,15 @@ TRPO_PARAMS = dict(
     lam=0.95,
     # entropy coefficient for the loss calculation
     ent_coef=0.0,
-    # TODO
+    # the number of iterations for the conjugate gradient calculation
     cg_iters=10,
-    # TODO
+    # the value function’s number iterations for learning
     vf_iters=3,
-    # TODO
+    # the value function stepsize
     vf_stepsize=3e-4,
-    # TODO
+    # the compute gradient dampening factor
     cg_damping=1e-2,
-    # TODO
+    # the Kullback-Leibler loss threshold
     max_kl=0.01,
 )
 
@@ -472,13 +472,13 @@ class RLAlgorithm(object):
         if is_ppo_policy(policy) or is_trpo_policy(policy):
             if actor_update_freq is not None:
                 print("WARNING: actor_update_freq is not utilized when running"
-                      " PPO. Ignoring.")
+                      " PPO/TRPO. Ignoring.")
             if meta_update_freq is not None:
                 print("WARNING: meta_update_freq is not utilized when running"
-                      " PPO. Ignoring.")
+                      " PPO/TRPO. Ignoring.")
             if nb_train_steps is not None:
                 print("WARNING: nb_train_steps is not utilized when running"
-                      " PPO. Ignoring.")
+                      " PPO/TRPO. Ignoring.")
 
         # Check for the number of levels in the network, for visualization
         # purposes.
@@ -860,13 +860,13 @@ class RLAlgorithm(object):
         # Include warnings if using PPO or TRPO.
         if is_ppo_policy(self.policy) or is_trpo_policy(self.policy):
             if log_interval is not None:
-                print("WARNING: log_interval for PPO policies set to after "
-                      "every training iteration.")
+                print("WARNING: log_interval for PPO/TRPO policies set to "
+                      "after every training iteration.")
             log_interval = self.nb_rollout_steps
 
             if initial_exploration_steps > 0:
-                print("WARNING: initial_exploration_steps set to 0 for PPO "
-                      "policies.")
+                print("WARNING: initial_exploration_steps set to 0 for "
+                      "PPO/TRPO policies.")
                 initial_exploration_steps = 0
 
         # Create a saver object.

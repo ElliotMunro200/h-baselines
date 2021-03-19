@@ -111,11 +111,17 @@ def reduce_var(tensor, axis=None, keepdims=False):
 
 
 def var_shape(tensor):
-    """
-    get TensorFlow Tensor shape
+    """Get TensorFlow Tensor shape.
 
-    :param tensor: (TensorFlow Tensor) the input tensor
-    :return: ([int]) the shape
+    Parameters
+    ----------
+    tensor : tf.Tensor
+        the input tensor
+
+    Returns
+    -------
+    list of int
+        the shape
     """
     out = tensor.get_shape().as_list()
     assert all(isinstance(a, int) for a in out), \
@@ -124,23 +130,37 @@ def var_shape(tensor):
 
 
 def numel(tensor):
-    """
-    get TensorFlow Tensor's number of elements
+    """Get TensorFlow Tensor's number of elements.
 
-    :param tensor: (TensorFlow Tensor) the input tensor
-    :return: (int) the number of elements
+    Parameters
+    ----------
+    tensor : tf.Tensor
+        the input tensor
+
+    Returns
+    -------
+    int
+        the number of elements
     """
     return int(np.prod(var_shape(tensor)))
 
 
 def flatgrad(loss, var_list, clip_norm=None):
-    """
-    calculates the gradient and flattens it
+    """Calculate the gradient and flattens it.
 
-    :param loss: (float) the loss value
-    :param var_list: ([TensorFlow Tensor]) the variables
-    :param clip_norm: (float) clip the gradients (disabled if None)
-    :return: ([TensorFlow Tensor]) flattened gradient
+    Parameters
+    ----------
+    loss : float
+        the loss value
+    var_list : list of tf.Tensor
+        the variables
+    clip_norm : float
+        clip the gradients (disabled if None)
+
+    Returns
+    -------
+    list of tf.Tensor
+        flattened gradient
     """
     grads = tf.gradients(loss, var_list)
     if clip_norm is not None:
@@ -152,13 +172,19 @@ def flatgrad(loss, var_list, clip_norm=None):
 
 
 class SetFromFlat(object):
-    def __init__(self, var_list, dtype=tf.float32, sess=None):
-        """
-        Set the parameters from a flat vector
+    """Set the parameters from a flat vector."""
 
-        :param var_list: ([TensorFlow Tensor]) the variables
-        :param dtype: (type) the type for the placeholder
-        :param sess: (TensorFlow Session)
+    def __init__(self, var_list, dtype=tf.float32, sess=None):
+        """Set the parameters from a flat vector.
+
+        Parameters
+        ----------
+        var_list : list of tf.Tensor
+            the variables
+        dtype : type
+            the type for the placeholder
+        sess : tf.Session
+            the tensorflow session
         """
         shapes = list(map(var_shape, var_list))
         total_size = np.sum([int(np.prod(shape)) for shape in shapes])
@@ -175,6 +201,7 @@ class SetFromFlat(object):
         self.sess = sess
 
     def __call__(self, theta):
+        """Perform the class-specific operation."""
         if self.sess is None:
             return tf.get_default_session().run(
                 self.operation, feed_dict={self.theta: theta})
@@ -184,18 +211,24 @@ class SetFromFlat(object):
 
 
 class GetFlat(object):
-    def __init__(self, var_list, sess=None):
-        """
-        Get the parameters as a flat vector
+    """Get the parameters as a flat vector."""
 
-        :param var_list: ([TensorFlow Tensor]) the variables
-        :param sess: (TensorFlow Session)
+    def __init__(self, var_list, sess=None):
+        """Get the parameters as a flat vector.
+
+        Parameters
+        ----------
+        var_list : list of tf.Tensor
+            the variables
+        sess : tf.Session
+            the tensorflow session
         """
         self.operation = tf.concat(
             axis=0, values=[tf.reshape(v, [numel(v)]) for v in var_list])
         self.sess = sess
 
     def __call__(self):
+        """Perform the class-specific operation."""
         if self.sess is None:
             return tf.get_default_session().run(self.operation)
         else:
@@ -560,16 +593,10 @@ def create_fcnet(obs,
 
         if stochastic:
             # Create the output mean.
-            policy_mean = layer(
-                pi_h, num_output, 'mean',
-                act_fun=None,
-            )
+            policy_mean = layer(pi_h, num_output, 'mean', act_fun=None)
 
             # Create the output log_std.
-            log_std = layer(
-                pi_h, num_output, 'log_std',
-                act_fun=None,
-            )
+            log_std = layer(pi_h, num_output, 'log_std', act_fun=None)
 
             policy = (policy_mean, log_std)
         else:
@@ -841,10 +868,10 @@ def process_minibatch(mb_obs,
         mb_rewards[env_num] = np.asarray(mb_rewards[env_num])
         mb_actions[env_num] = np.concatenate(mb_actions[env_num], axis=0)
         mb_values[env_num] = np.concatenate(mb_values[env_num], axis=0)
-        if mb_neglogpacs is not None:  # TRPO case
+        mb_dones[env_num] = np.asarray(mb_dones[env_num])
+        if mb_neglogpacs is not None:
             mb_neglogpacs[env_num] = np.concatenate(
                 mb_neglogpacs[env_num], axis=0)
-        mb_dones[env_num] = np.asarray(mb_dones[env_num])
 
         # TODO
         if max_traj_length is not None:
@@ -886,19 +913,19 @@ def process_minibatch(mb_obs,
         mb_contexts = np.concatenate(mb_contexts, axis=0)
         mb_actions = np.concatenate(mb_actions, axis=0)
         mb_values = np.concatenate(mb_values, axis=0)
-        if mb_neglogpacs is not None:  # TRPO case
-            mb_neglogpacs = np.concatenate(mb_neglogpacs, axis=0)
         mb_all_obs = np.concatenate(mb_all_obs, axis=0)
         mb_returns = np.concatenate(mb_returns, axis=0)
+        if mb_neglogpacs is not None:
+            mb_neglogpacs = np.concatenate(mb_neglogpacs, axis=0)
     else:
         mb_obs = mb_obs[0]
         mb_contexts = mb_contexts[0]
         mb_actions = mb_actions[0]
         mb_values = mb_values[0]
-        if mb_neglogpacs is not None:  # TRPO case
-            mb_neglogpacs = mb_neglogpacs[0]
         mb_all_obs = mb_all_obs[0]
         mb_returns = mb_returns[0]
+        if mb_neglogpacs is not None:
+            mb_neglogpacs = mb_neglogpacs[0]
 
     # Compute the advantages.
     advs = mb_returns - mb_values
