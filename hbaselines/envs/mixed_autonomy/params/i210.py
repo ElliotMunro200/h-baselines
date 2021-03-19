@@ -27,7 +27,7 @@ INFLOW_SPEED = 25.5
 # fraction of vehicles that are RL vehicles. 0.10 corresponds to 10%
 PENETRATION_RATE = 1/22
 # horizon over which to run the env
-HORIZON = 1500
+HORIZON = 1000
 # range for the inflows allowed in the network. If set to None, the inflows are
 # not modified from their initial value.
 INFLOWS = [1000, 2000]

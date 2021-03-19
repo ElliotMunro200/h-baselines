@@ -26,9 +26,15 @@ FLOW_ENV_NAMES = [
     "highway-v0",
     "highway-v1",
     "highway-v2",
+    "multiagent-highway-v0",
+    "multiagent-highway-v1",
+    "multiagent-highway-v2",
     "i210-v0",
     "i210-v1",
     "i210-v2",
+    "multiagent-i210-v0",
+    "multiagent-i210-v1",
+    "multiagent-i210-v2",
 ]
 
 
@@ -174,8 +180,8 @@ def main(args):
                         k: np.array([obs[k]]) for k in obs.keys()}
                     obs1_transition = {
                         k: np.array([new_obs[k]]) for k in new_obs.keys()}
-                    total_reward += sum(
-                        reward[key] for key in reward.keys())
+                    total_reward += np.mean([
+                        reward[key] for key in reward.keys()])
                 else:
                     if done:
                         break

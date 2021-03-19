@@ -149,7 +149,7 @@ class AVEnv(Env):
         self._mean_accels = []
         self._obs_history = defaultdict(list)
         self._obs_frames = env_params.additional_params["obs_frames"]
-        self._skip = int(5 * 0.4 / self.sim_step)
+        self._skip = 1
 
         # dynamics controller for controlled RL vehicles. Only relevant if
         # "use_follower_stopper" is set to True.
@@ -529,6 +529,11 @@ class AVEnv(Env):
                 # Assign the inflow rate to match the xml number.
                 inflow_rate = self.warmup_description["inflow"][xml_num]
                 end_speed = self.warmup_description["end_speed"][xml_num]
+
+                # Modify the inflow rate for the I-210 network.
+                if isinstance(self.k.network.network, I210SubNetwork):
+                    inflow_rate *= 5
+
                 print("inflow: {}, end_speed: {}".format(
                     inflow_rate, end_speed))
             else:

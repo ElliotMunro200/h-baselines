@@ -732,7 +732,7 @@ def gae_returns(mb_rewards, mb_values, mb_dones, last_values, gamma, lam):
     mb_advs = np.zeros_like(mb_rewards)
     mb_vactual = np.zeros_like(mb_rewards)
     lastgaelam = 0
-    traj_length = []
+    traj_length = [0]
     for t in reversed(range(n_steps)):
         if t == n_steps - 1:
             if mb_dones[-1]:

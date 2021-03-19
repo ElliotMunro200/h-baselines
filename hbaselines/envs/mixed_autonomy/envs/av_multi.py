@@ -93,10 +93,10 @@ class AVMultiAgentEnv(AVEnv):
             reward = {key: 0 for key in rl_ids}
         else:
             c1 = 0.01  # reward scale for the speeds
-            c2 = 0.50  # reward scale for the accelerations
+            c2 = 0.10  # reward scale for the accelerations
 
             reward = {
-                key: (- c1 * (self.k.vehicle.get_speed(key) - self._v_eq) ** 2
+                key: (- c1 * (self.k.vehicle.get_speed(key)-self._v_eq) ** 2
                       - c2 * rl_actions[key][0] ** 2)
                 for key in rl_ids
             }
