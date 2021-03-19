@@ -610,19 +610,19 @@ class FeedForwardPolicy(Policy):
         """See parent class."""
         # In case not all environment numbers were used, reduce the shape of
         # the datasets.
-        num_envs = sum([
-            int(self.last_obs[i] is not None) for i in range(self.num_envs)])
+        indices = [
+            i for i in range(self.num_envs) if self.last_obs[i] is not None]
+        num_envs = len(indices)
 
-        self.mb_rewards = self.mb_rewards[:num_envs]
-        self.mb_obs = self.mb_obs[:num_envs]
-        self.mb_contexts = self.mb_contexts[:num_envs]
-        self.mb_actions = self.mb_actions[:num_envs]
-        self.mb_values = self.mb_values[:num_envs]
-        self.mb_neglogpacs = self.mb_neglogpacs[:num_envs]
-        self.mb_dones = self.mb_dones[:num_envs]
-        self.mb_all_obs = self.mb_all_obs[:num_envs]
-        self.mb_returns = self.mb_returns[:num_envs]
-        self.last_obs = self.last_obs[:num_envs]
+        self.mb_rewards = self._sample(self.mb_rewards, indices)
+        self.mb_obs = self._sample(self.mb_obs, indices)
+        self.mb_contexts = self._sample(self.mb_contexts, indices)
+        self.mb_actions = self._sample(self.mb_actions, indices)
+        self.mb_values = self._sample(self.mb_values, indices)
+        self.mb_dones = self._sample(self.mb_dones, indices)
+        self.mb_all_obs = self._sample(self.mb_all_obs, indices)
+        self.mb_returns = self._sample(self.mb_returns, indices)
+        self.last_obs = self._sample(self.last_obs, indices)
 
         # Compute the last estimated value.
         last_values = [
@@ -771,3 +771,8 @@ class FeedForwardPolicy(Policy):
             self.phase_ph: 0,
             self.rate_ph: 0.0,
         }
+
+    @staticmethod
+    def _sample(vals, indices):
+        """Sample indices from a list."""
+        return [vals[i] for i in range(len(vals)) if i in indices]

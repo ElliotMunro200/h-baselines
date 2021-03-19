@@ -13,7 +13,7 @@ from hbaselines.utils.eval import get_hyperparameters_from_dir
 from hbaselines.utils.eval import TrajectoryLogger
 
 # name of Flow environments. These are rendered differently
-FLOW_ENV_NAMES = [
+FLOW_ENVS = [
     "ring-v0",
     "ring-v0-fast",
     "ring-v1-fast",
@@ -26,15 +26,9 @@ FLOW_ENV_NAMES = [
     "highway-v0",
     "highway-v1",
     "highway-v2",
-    "multiagent-highway-v0",
-    "multiagent-highway-v1",
-    "multiagent-highway-v2",
     "i210-v0",
     "i210-v1",
     "i210-v2",
-    "multiagent-i210-v0",
-    "multiagent-i210-v1",
-    "multiagent-i210-v2",
 ]
 
 
@@ -96,7 +90,7 @@ def main(args):
     episode_rewards = []
 
     # Add an emission path to Flow environments.
-    if env_name in FLOW_ENV_NAMES:
+    if env_name in FLOW_ENVS or (multiagent and env_name[11:] in FLOW_ENVS):
         sim_params = deepcopy(env.wrapped_env.sim_params)
         sim_params.emission_path = "./flow_results"
         env.wrapped_env.restart_simulation(
@@ -109,7 +103,7 @@ def main(args):
 
     for env_num, env in enumerate(env_list):
         for episode_num in range(flags.num_rollouts):
-            if not flags.no_render and env_name not in FLOW_ENV_NAMES:
+            if not flags.no_render and env_name not in FLOW_ENVS:
                 out = FFmpegWriter("{}_{}_{}.mp4".format(
                     flags.video, env_num, episode_num))
             else:
@@ -210,7 +204,7 @@ def main(args):
                 print("Round {}, {}: {}".format(episode_num, key, info[key]))
 
             # Save the video.
-            if not flags.no_render and env_name not in FLOW_ENV_NAMES \
+            if not flags.no_render and env_name not in FLOW_ENVS \
                     and flags.save_video:
                 out.close()
 
