@@ -92,14 +92,20 @@ class AVMultiAgentEnv(AVEnv):
             # Return a reward of 0 case of collisions or an empty network.
             reward = {key: 0 for key in rl_ids}
         else:
-            c1 = 0.01  # reward scale for the speeds
+            c1 = 1.00  # reward scale for the speeds
             c2 = 0.10  # reward scale for the accelerations
+            v_des = 8  # desired speed (in m/s)
 
-            reward = {
-                key: (- c1 * (self.k.vehicle.get_speed(key)-self._v_eq) ** 2
-                      - c2 * rl_actions[key][0] ** 2)
-                for key in rl_ids
-            }
+            reward = {}
+            for key in rl_ids:
+                # speed gain
+                vel = self.k.vehicle.get_speed(key)
+                rew1 = min(v_des, (v_des - abs(vel - v_des))) / v_des
+
+                # acceleration penalty
+                rew2 = -abs(rl_actions[key][0])
+
+                reward[key] = c1 * rew1 + c2 * rew2
 
         return reward
 

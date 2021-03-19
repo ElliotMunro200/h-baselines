@@ -24,9 +24,9 @@ END_SPEED = 6.0
 # inflow rate on the highway in vehicles per hour
 TRAFFIC_FLOW = 2215
 # number of steps per rollout
-HORIZON = 1000
+HORIZON = 1500
 # percentage of autonomous vehicles compared to human vehicles on highway
-PENETRATION_RATE = 1/22
+PENETRATION_RATE = 1/20
 # range for the inflows allowed in the network. If set to None, the inflows are
 # not modified from their initial value.
 INFLOWS = [1000, 2000]

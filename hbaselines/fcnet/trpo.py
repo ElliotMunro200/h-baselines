@@ -642,7 +642,7 @@ class FeedForwardPolicy(Policy):
             gamma=self.gamma,
             lam=self.lam,
             num_envs=num_envs,
-            max_traj_length=None,  # 150,
+            max_traj_length=150,
         )
 
         self.update_from_batch(
