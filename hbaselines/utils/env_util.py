@@ -24,20 +24,26 @@ try:
 except (ImportError, ModuleNotFoundError):
     pass
 
-import flow.config as config
-from hbaselines.envs.mixed_autonomy import FlowEnv
-from hbaselines.envs.mixed_autonomy.params.merge \
-    import get_flow_params as merge
-from hbaselines.envs.mixed_autonomy.params.ring \
-    import get_flow_params as ring
-from hbaselines.envs.mixed_autonomy.params.highway \
-    import get_flow_params as highway
-from hbaselines.envs.mixed_autonomy.params.i210 \
-    import get_flow_params as i210
-from hbaselines.envs.mixed_autonomy.envs.ring_nonflow \
-    import RingSingleAgentEnv
-from hbaselines.envs.mixed_autonomy.envs.ring_nonflow \
-    import RingMultiAgentEnv
+try:
+    import flow.config as config
+    from hbaselines.envs.mixed_autonomy import FlowEnv
+    from hbaselines.envs.mixed_autonomy.params.merge \
+        import get_flow_params as merge
+    from hbaselines.envs.mixed_autonomy.params.ring \
+        import get_flow_params as ring
+    from hbaselines.envs.mixed_autonomy.params.highway \
+        import get_flow_params as highway
+    from hbaselines.envs.mixed_autonomy.params.i210 \
+        import get_flow_params as i210
+    from hbaselines.envs.mixed_autonomy.envs.ring_nonflow \
+        import RingSingleAgentEnv
+    from hbaselines.envs.mixed_autonomy.envs.ring_nonflow \
+        import RingMultiAgentEnv
+except (ImportError, ModuleNotFoundError) as e:  # pragma: no cover
+    # ray seems to have a bug that requires you to install ray[tune] twice
+    if "ray" in str(e):  # pragma: no cover
+        raise e  # pragma: no cover
+    pass  # pragma: no cover
 
 try:
     from hbaselines.envs.point2d import Point2DEnv
@@ -793,7 +799,7 @@ def _get_ring_env_attributes(scale):
             length=[250 * scale, 360 * scale],
             num_vehicles=22 * scale,
             dt=0.2,
-            horizon=1500,
+            horizon=3000,
             gen_emission=False,
             rl_ids=[22 * i for i in range(scale)],
             warmup_steps=0,
