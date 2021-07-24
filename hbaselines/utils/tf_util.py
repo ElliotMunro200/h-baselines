@@ -536,6 +536,7 @@ def create_fcnet(obs,
                  dropout,
                  rate,
                  ac_space=None,
+                 mask=None,
                  scope=None,
                  reuse=False,
                  output_pre=""):
@@ -566,6 +567,8 @@ def create_fcnet(obs,
         the probability that each element is dropped if dropout is implemented
     ac_space : None or list or Box or Discrete
         the action space. Used to switch to discrete
+    mask : tf.Variable
+        the action mask
     scope : str
         the scope name of the model
     reuse : bool
@@ -617,6 +620,10 @@ def create_fcnet(obs,
                 kernel_initializer=tf.random_uniform_initializer(
                     minval=-3e-3, maxval=3e-3)
             )
+
+            # Add the action mask.
+            if mask is not None:
+                policy = mask * policy
 
             # Sample from a categorical distribution.
             if is_discrete:

@@ -28,6 +28,7 @@ class ReplayBuffer(object):
 
         self.obs_t = np.zeros((buffer_size, obs_dim), dtype=np.float32)
         self.action_t = np.zeros((buffer_size, ac_dim), dtype=np.float32)
+        self.mask_t = np.zeros((buffer_size, ac_dim), dtype=np.float32)
         self.reward = np.zeros(buffer_size, dtype=np.float32)
         self.obs_tp1 = np.zeros((buffer_size, obs_dim), dtype=np.float32)
         self.done = np.zeros(buffer_size, dtype=np.float32)
@@ -88,7 +89,7 @@ class ReplayBuffer(object):
         """
         return len(self) == self.buffer_size
 
-    def add(self, obs_t, action, reward, obs_tp1, done):
+    def add(self, obs_t, action, reward, obs_tp1, done, mask):
         """Add a new transition to the buffer.
 
         Parameters
@@ -106,6 +107,7 @@ class ReplayBuffer(object):
         """
         self.obs_t[self._next_idx, :] = obs_t
         self.action_t[self._next_idx, :] = action
+        self.mask_t[self._next_idx, :] = mask
         self.reward[self._next_idx] = reward
         self.obs_tp1[self._next_idx, :] = obs_tp1
         self.done[self._next_idx] = done
@@ -135,4 +137,5 @@ class ReplayBuffer(object):
         idxes = np.random.randint(0, self._size, size=self._batch_size)
 
         return self.obs_t[idxes, :], self.action_t[idxes, :], \
-            self.reward[idxes], self.obs_tp1[idxes, :], self.done[idxes]
+            self.reward[idxes], self.obs_tp1[idxes, :], self.done[idxes], \
+            self.mask_t[idxes, :]

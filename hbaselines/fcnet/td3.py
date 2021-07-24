@@ -199,11 +199,18 @@ class FeedForwardPolicy(Policy):
         # Step 1: Create a replay buffer object.                              #
         # =================================================================== #
 
+        if isinstance(self.ac_space, Box):
+            num_output = self.ac_space.shape[0]
+        elif isinstance(self.ac_space, list):
+            num_output = sum(ac_space.n for ac_space in self.ac_space)
+        else:
+            num_output = self.ac_space.n
+
         self.replay_buffer = ReplayBuffer(
             buffer_size=self.buffer_size,
             batch_size=self.batch_size,
             obs_dim=ob_dim[0],
-            ac_dim=self.ac_space.shape[0],
+            ac_dim=num_output,
         )
 
         # =================================================================== #
@@ -221,7 +228,11 @@ class FeedForwardPolicy(Policy):
                 name='rewards')
             self.action_ph = tf.compat.v1.placeholder(
                 tf.float32,
-                shape=(None,) + ac_space.shape,
+                shape=(None, num_output),
+                name='actions')
+            self.mask_ph = tf.compat.v1.placeholder(
+                tf.float32,
+                shape=(None, num_output),
                 name='actions')
             self.obs_ph = tf.compat.v1.placeholder(
                 tf.float32,
@@ -427,6 +438,7 @@ class FeedForwardPolicy(Policy):
             dropout=self.model_params["dropout"],
             rate=self.rate_ph,
             ac_space=self.ac_space,
+            mask=self.mask_ph,
             scope=scope,
             reuse=reuse,
         )
@@ -520,10 +532,11 @@ class FeedForwardPolicy(Policy):
             return
 
         # Get a batch
-        obs0, actions, rewards, obs1, terminals1 = self.replay_buffer.sample()
+        obs0, actions, rewards, obs1, terminals1, mask = \
+            self.replay_buffer.sample()
 
         return self.update_from_batch(
-            obs0, actions, rewards, obs1, terminals1, update_actor)
+            obs0, actions, rewards, obs1, terminals1, mask, update_actor)
 
     def update_from_batch(self,
                           obs0,
@@ -531,6 +544,7 @@ class FeedForwardPolicy(Policy):
                           rewards,
                           obs1,
                           terminals1,
+                          mask,
                           update_actor=True):
         """Perform gradient update step given a batch of data.
 
@@ -573,10 +587,17 @@ class FeedForwardPolicy(Policy):
             self.obs1_ph: (obs1 - self.ob_min) / (self.ob_max - self.ob_min),
             self.terminals1: terminals1,
             self.phase_ph: 1,
+            self.mask_ph: mask,
             self.rate_ph: 0.5,
         })
 
-    def get_action(self, obs, context, apply_noise, random_actions, env_num=0):
+    def get_action(self,
+                   obs,
+                   context,
+                   apply_noise,
+                   random_actions,
+                   mask,
+                   env_num=0):
         """See parent class."""
         # Add the contextual observation, if applicable.
         obs = self._get_obs(obs, context, axis=1)
@@ -598,6 +619,7 @@ class FeedForwardPolicy(Policy):
         else:
             action = self.sess.run(self.actor_tf, {
                 self.obs_ph: obs,
+                self.mask_ph: mask,
                 self.phase_ph: 0,
                 self.rate_ph: 0.0,
             })
@@ -613,7 +635,7 @@ class FeedForwardPolicy(Policy):
         return action
 
     def store_transition(self, obs0, context0, action, reward, obs1, context1,
-                         done, is_final_step, env_num=0, evaluate=False):
+                         done, is_final_step, mask, env_num=0, evaluate=False):
         """See parent class."""
         if not evaluate:
             # Add the contextual observation, if applicable.
@@ -624,7 +646,8 @@ class FeedForwardPolicy(Policy):
             # masks that correspond to the final step are set to False.
             done = done and not is_final_step
 
-            self.replay_buffer.add(obs0, action, reward, obs1, float(done))
+            self.replay_buffer.add(
+                obs0, action, reward, obs1, float(done), mask)
 
     def initialize(self):
         """See parent class.
