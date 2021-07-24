@@ -1,8 +1,10 @@
 """TensorFlow utility methods."""
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
+import tensorflow_probability as tfp
 import numpy as np
 from functools import reduce
+from gym.spaces import Discrete
 
 # Stabilizing term to avoid NaN (prevents division by zero or log of zero)
 EPS = 1e-6
@@ -533,6 +535,7 @@ def create_fcnet(obs,
                  phase,
                  dropout,
                  rate,
+                 ac_space=None,
                  scope=None,
                  reuse=False,
                  output_pre=""):
@@ -561,6 +564,8 @@ def create_fcnet(obs,
         whether to enable dropout
     rate : tf.compat.v1.placeholder
         the probability that each element is dropped if dropout is implemented
+    ac_space : None or list or Box or Discrete
+        the action space. Used to switch to discrete
     scope : str
         the scope name of the model
     reuse : bool
@@ -576,6 +581,9 @@ def create_fcnet(obs,
         model in the deterministic case and a tuple of the (mean, logstd) in
         the stochastic case
     """
+    is_discrete = ac_space is not None and (isinstance(ac_space, Discrete) or (
+        isinstance(ac_space, list) and isinstance(ac_space[0], Discrete)))
+
     with tf.compat.v1.variable_scope(scope, reuse=reuse):
         pi_h = obs
 
@@ -602,11 +610,18 @@ def create_fcnet(obs,
         else:
             # Create the output layer.
             policy = layer(
-                pi_h, num_output, '{}output'.format(output_pre),
-                act_fun=None,
+                pi_h,
+                num_output,
+                '{}output'.format(output_pre),
+                act_fun=tf.nn.tanh if is_discrete else None,
                 kernel_initializer=tf.random_uniform_initializer(
                     minval=-3e-3, maxval=3e-3)
             )
+
+            # Sample from a categorical distribution.
+            if is_discrete:
+                policy = tfp.distributions.RelaxedOneHotCategorical(
+                    temperature=0.5, probs=0.5 + 0.5 * policy)
 
         return policy
 

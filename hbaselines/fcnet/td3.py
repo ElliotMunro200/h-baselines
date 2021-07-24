@@ -1,6 +1,7 @@
 """TD3-compatible feedforward policy."""
 import tensorflow as tf
 import numpy as np
+from gym.spaces import Box
 
 from hbaselines.base_policies import Policy
 from hbaselines.fcnet.replay_buffer import ReplayBuffer
@@ -380,6 +381,13 @@ class FeedForwardPolicy(Policy):
         tf.Variable
             the output from the actor
         """
+        if isinstance(self.ac_space, Box):
+            num_output = self.ac_space.shape[0]
+        elif isinstance(self.ac_space, list):
+            num_output = sum(ac_space.n for ac_space in self.ac_space)
+        else:
+            num_output = self.ac_space.n
+
         # Initial image pre-processing (for convolutional policies).
         if self.model_params["model_type"] == "conv":
             pi_h = create_conv(
@@ -408,7 +416,7 @@ class FeedForwardPolicy(Policy):
         policy = create_fcnet(
             obs=pi_h,
             layers=self.model_params["layers"],
-            num_output=self.ac_space.shape[0],
+            num_output=num_output,
             stochastic=False,
             act_fun=self.model_params["act_fun"],
             layer_norm=self.model_params["layer_norm"],
@@ -416,16 +424,22 @@ class FeedForwardPolicy(Policy):
             phase=self.phase_ph,
             dropout=self.model_params["dropout"],
             rate=self.rate_ph,
+            ac_space=self.ac_space,
             scope=scope,
             reuse=reuse,
         )
 
-        # Scaling terms to the output from the policy.
-        ac_means = (self.ac_space.high + self.ac_space.low) / 2.
-        ac_magnitudes = (self.ac_space.high - self.ac_space.low) / 2.
+        if isinstance(self.ac_space, Box):
+            # Scaling terms to the output from the policy.
+            ac_means = (self.ac_space.high + self.ac_space.low) / 2.
+            ac_magnitudes = (self.ac_space.high - self.ac_space.low) / 2.
 
-        # Apply squashing and scale by action space.
-        return ac_means + ac_magnitudes * tf.nn.tanh(policy)
+            # Apply squashing and scale by action space.
+            return ac_means + ac_magnitudes * tf.nn.tanh(policy)
+        else:
+            # The policy has been turned into a deterministic categorical
+            # distribution. Return as is.
+            return policy
 
     def make_critic(self, obs, action, reuse=False, scope="qf"):
         """Create a critic tensor.
