@@ -1,7 +1,9 @@
 """TD3-compatible feedforward policy."""
 import tensorflow as tf
+import tensorflow_probability as tfp
 import numpy as np
 from gym.spaces import Box
+from gym.spaces import Discrete
 
 from hbaselines.base_policies import Policy
 from hbaselines.fcnet.replay_buffer import ReplayBuffer
@@ -11,6 +13,7 @@ from hbaselines.utils.tf_util import get_trainable_vars
 from hbaselines.utils.tf_util import reduce_std
 from hbaselines.utils.tf_util import print_params_shape
 from hbaselines.utils.tf_util import setup_target_updates
+from hbaselines.utils.tf_util import one_hot
 
 
 class FeedForwardPolicy(Policy):
@@ -255,17 +258,65 @@ class FeedForwardPolicy(Policy):
 
         # Create networks and core TF parts that are shared across setup parts.
         with tf.compat.v1.variable_scope("model", reuse=False):
+            # Create the actor.
             self.actor_tf = self.make_actor(self.obs_ph)
+
+            # Create the critic.
             self.critic_tf = [
-                self.make_critic(self.obs_ph, self.action_ph,
-                                 scope="qf_{}".format(i))
+                self.make_critic(
+                    self.obs_ph, self.action_ph, scope="qf_{}".format(i))
                 for i in range(2)
             ]
+
+            # Apply gumbel softmax for categorical distributions.
+            if isinstance(self.ac_space, Box):
+                actor = self.actor_tf
+            elif isinstance(self.ac_space, list):
+                prob = []
+                for i in range(len(self.ac_space)):
+                    ix_min = sum(self.ac_space[:i])
+                    ix_max = sum(self.ac_space[:i + 1])
+
+                    # Convert logits to probabilities.
+                    odds = tf.exp(self.actor_tf[:, ix_min: ix_max])
+                    prob.append(odds / (1 + odds))
+
+                    # Add the mask.
+                    prob[-1] *= self.mask_ph[:, ix_min:ix_max]
+
+                # Update the actor.
+                actor = tf.concat([
+                    tfp.distributions.RelaxedOneHotCategorical(
+                        temperature=0.5, probs=prob[i]).sample()
+                    for i in range(len(self.ac_space))], axis=-1)
+            else:
+                # Convert logits to probabilities.
+                odds = tf.exp(self.actor_tf)
+                prob = odds / (1 + odds)
+
+                # Add the mask.
+                prob[-1] *= self.mask_ph
+
+                # Update the actor.
+                actor = tfp.distributions.RelaxedOneHotCategorical(
+                    temperature=0.5, probs=prob[0]).sample()
+
+            # Create a differentiable critic.
             self.critic_with_actor_tf = [
-                self.make_critic(self.obs_ph, self.actor_tf, reuse=True,
-                                 scope="qf_{}".format(i))
+                self.make_critic(
+                    self.obs_ph, actor, reuse=True, scope="qf_{}".format(i))
                 for i in range(2)
             ]
+
+            # Sample actions from the actor via a softmax.
+            if isinstance(self.ac_space, Discrete):
+                self.actor_tf = tf.nn.softmax(self.actor_tf)
+            elif isinstance(self.ac_space, list):
+                self.actor_tf = tf.concat([
+                    tf.nn.softmax(self.actor_tf[
+                        :, sum(self.ac_space[:i]):sum(self.ac_space[:i+1])])
+                    for i in range(len(self.ac_space))],
+                    axis=-1)
 
         with tf.compat.v1.variable_scope("target", reuse=False):
             # create the target actor policy
@@ -437,8 +488,6 @@ class FeedForwardPolicy(Policy):
             phase=self.phase_ph,
             dropout=self.model_params["dropout"],
             rate=self.rate_ph,
-            ac_space=self.ac_space,
-            mask=self.mask_ph,
             scope=scope,
             reuse=reuse,
         )
@@ -451,8 +500,7 @@ class FeedForwardPolicy(Policy):
             # Apply squashing and scale by action space.
             return ac_means + ac_magnitudes * tf.nn.tanh(policy)
         else:
-            # The policy has been turned into a deterministic categorical
-            # distribution. Return as is.
+            # The policy will a categorical distribution. Return as is.
             return policy
 
     def make_critic(self, obs, action, reuse=False, scope="qf"):
@@ -596,7 +644,6 @@ class FeedForwardPolicy(Policy):
                    context,
                    apply_noise,
                    random_actions,
-                   mask,
                    env_num=0):
         """See parent class."""
         # Add the contextual observation, if applicable.
@@ -613,13 +660,13 @@ class FeedForwardPolicy(Policy):
 
         if random_actions:
             if isinstance(self.ac_space, list):
-                action = [a.sample() for a in self.ac_space]
+                action = np.array([np.concatenate([
+                    one_hot(a.sample(), a.n) for a in self.ac_space])])
             else:
                 action = np.array([self.ac_space.sample()])
         else:
             action = self.sess.run(self.actor_tf, {
                 self.obs_ph: obs,
-                self.mask_ph: mask,
                 self.phase_ph: 0,
                 self.rate_ph: 0.0,
             })

@@ -1107,6 +1107,7 @@ class RLAlgorithm(object):
                     obs1=obs[0] if reset else obs,
                     context1=context,
                     terminal1=done,
+                    mask=info["mask"],
                     is_final_step=(self.episode_step[num] >= self.horizon - 1),
                     all_obs0=self.all_obs[num],
                     all_obs1=all_obs[0] if reset else all_obs,
